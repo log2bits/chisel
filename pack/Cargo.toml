@@ -1,0 +1,8 @@
+[package]
+name = "chisel-pack"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chisel-core = { path = "../core" }
+anyhow = "1"

@@ -4,7 +4,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use serde::Deserialize;
 use anyhow::Result;
-use chisel::reader::block_state::{build_block_key, BlockStateTable};
+use chisel_core::reader::block_state::{build_block_key, BlockStateTable};
+use chisel_core::carver;
 
 #[derive(Deserialize)]
 struct BlockEntry {
@@ -60,7 +61,7 @@ fn main() -> Result<()> {
   println!("done ({} block states)", entries.len());
 
   print!("  [3/3] running carver... ");
-  chisel::carver::generate_materials(&client_jar, &out_dir.join("materials.bin"))?;
+  carver::generate_materials(&client_jar, &out_dir.join("materials.bin"))?;
   println!("done");
 
   println!("\nall data files generated successfully.");

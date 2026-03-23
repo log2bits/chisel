@@ -1,4 +1,4 @@
-use chisel::reader;
+use chisel_core::reader;
 use std::path::Path;
 
 fn main() {
