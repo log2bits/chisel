@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use serde::Deserialize;
 use anyhow::Result;
-use chisel_core::reader::block_state::{build_block_key, BlockStateTable};
+use chisel_core::reader::block_states::{build_block_key, BlockStateTable};
 use chisel_core::carver;
 
 #[derive(Deserialize)]

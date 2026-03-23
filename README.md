@@ -495,9 +495,9 @@ chisel/
 
       reader/
         mod.rs            # open_world entry point, zip traversal
-        region.rs         # .mca file parsing, chunk location table, decompression
-        chunk.rs          # chunk NBT decoding (all DataVersion branches)
-        block_state.rs    # BlockStateTable, build_block_key, load from block_states.bin
+        region.rs         # .mca file parsing
+        chunk.rs          # chunk location table, decompression, chunk NBT decoding (all DataVersion branches)
+        block_states.rs   # BlockStateTable, build_block_key, load from block_states.bin
         legacy.rs         # pre-1.13 numeric ID + metadata mapping (TODO)
 
       carver/

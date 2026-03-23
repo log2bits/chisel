@@ -1,12 +1,18 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::Read};
 
+use flate2::read::{GzDecoder, ZlibDecoder};
 use serde::Deserialize;
 use anyhow::Result;
 
-use crate::reader::block_state::BlockStateTable;
+use crate::reader::block_states::BlockStateTable;
 
 pub struct Chunk {
   pub sections: Vec<Section>,
+}
+
+pub struct ChunkLocation {
+  pub sector_offset: u32,
+  pub sector_count: u8,
 }
 pub struct Section {
   pub y: i8,
@@ -41,6 +47,31 @@ struct PaletteEntry {
   #[serde(rename = "Properties")]
   #[serde(default)]
   properties: BTreeMap<String, String>,
+}
+
+pub fn decompress_chunk(data: &[u8], chunk_location: &ChunkLocation) -> Result<Vec<u8>> {
+  let base = (chunk_location.sector_offset * 4096) as usize;
+  let length = u32::from_be_bytes([data[base], data[base+1], data[base+2], data[base+3]]);
+  let compression_type = data[base + 4];
+  let compressed = &data[base + 5..base + 4 + length as usize];
+  match compression_type {
+    1 => {
+      let mut decoder = GzDecoder::new(compressed);
+      let mut out = Vec::new();
+      decoder.read_to_end(&mut out)?;
+      Ok(out)
+    }
+    2 => {
+      let mut decoder = ZlibDecoder::new(compressed);
+      let mut out = Vec::new();
+      decoder.read_to_end(&mut out)?;
+      Ok(out)
+    }
+    3 => {
+      Ok(compressed.to_vec())
+    }
+    _ => Err(anyhow::anyhow!("unsupported compression type: {}", compression_type)),
+  }
 }
 
 pub fn decode_chunk(data: &[u8], table: &BlockStateTable) -> Result<Chunk> {

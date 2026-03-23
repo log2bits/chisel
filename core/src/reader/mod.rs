@@ -1,5 +1,5 @@
 pub mod region;
-pub mod block_state;
+pub mod block_states;
 pub mod chunk;
 pub mod legacy;
 
@@ -9,7 +9,7 @@ use anyhow::Result;
 
 pub fn open_world(world_path: &Path) -> Result<()> {
   let table_data = std::fs::read("data/block_states.bin")?;
-  let table = block_state::BlockStateTable::load(&table_data);
+  let table = block_states::BlockStateTable::load(&table_data);
 
 
   let world_file = File::open(world_path)?;
@@ -42,7 +42,7 @@ pub fn open_world(world_path: &Path) -> Result<()> {
     file.read_to_end(&mut bytes)?;
     for chunk_location in region::read_locations(&bytes) {
       if let Some(location) = chunk_location {
-        let decompressed = region::decompress_chunk(&bytes, &location)?;
+        let decompressed = chunk::decompress_chunk(&bytes, &location)?;
         let chunk = chunk::decode_chunk(&decompressed, &table)?;
       }
     }
