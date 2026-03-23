@@ -3,7 +3,12 @@ use std::io::{BufWriter, Write};
 use std::fs::File;
 use anyhow::Result;
 
+fn strip_namespace(name: &str) -> &str {
+  name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
 pub fn build_block_key(name: &str, properties: &BTreeMap<String, String>) -> String {
+  let name = strip_namespace(name);
   if properties.is_empty() {
     name.to_string()
   } else {
@@ -54,7 +59,7 @@ impl BlockStateTable {
     let key = build_block_key(name, properties);
     let result = self.map.get(&key).copied();
     if result.is_none() {
-      println!("Cant find block in lookup table: {}", key);
+      println!("can't find block in lookup table: {}", key);
     }
     result
   }
