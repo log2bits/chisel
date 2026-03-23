@@ -1,0 +1,1 @@
+pub const OCTREE_DEPTH: usize = 6;
