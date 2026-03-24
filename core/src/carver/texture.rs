@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use super::jar::Jar;
 
@@ -98,16 +100,18 @@ pub fn apply_tint(rgba: [u8; 4], _tint: i32) -> [u8; 4] {
 #[derive(Default)]
 pub struct Palette {
   pub colors: Vec<[u8; 4]>,
+  index: HashMap<[u8; 4], u8>,
 }
 
 impl Palette {
   pub fn get_or_insert(&mut self, rgba: [u8; 4]) -> u8 {
-    for (i, c) in self.colors.iter().enumerate() {
-      if *c == rgba { return i as u8; }
+    if let Some(&idx) = self.index.get(&rgba) {
+      return idx;
     }
     if self.colors.len() < 256 {
       let idx = self.colors.len() as u8;
       self.colors.push(rgba);
+      self.index.insert(rgba, idx);
       idx
     } else {
       self.nearest(rgba)

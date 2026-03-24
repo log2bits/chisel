@@ -81,6 +81,10 @@ pub struct Quad {
   pub elem_to: [f32; 3],
   pub elem_rot: Option<ElemRotation>,
   pub tint: i32,
+  /// Blockstate variant rotation (degrees, multiples of 90).
+  /// Applied Y-axis first, then X-axis, around block center (8,8,8).
+  pub bs_x_rot: u32,
+  pub bs_y_rot: u32,
 }
 
 #[derive(Clone)]
@@ -160,7 +164,15 @@ fn rotate_point(p: [f32; 3], origin: [f32; 3], axis: &str, angle_deg: f32, resca
 }
 
 pub fn unrotate_point(p: [f32; 3], origin: [f32; 3], axis: &str, angle_deg: f32, rescale: bool) -> [f32; 3] {
-  rotate_point(p, origin, axis, -angle_deg, rescale)
+  if !rescale {
+    return rotate_point(p, origin, axis, -angle_deg, false);
+  }
+  // Forward: world = origin + R(angle) × (local − origin) / |cos(angle)|
+  // Inverse: local = origin + |cos(angle)| × R(−angle) × (world − origin)
+  let cos = angle_deg.to_radians().abs().cos().max(1e-4);
+  let r = rotate_point(p, origin, axis, -angle_deg, false);
+  let [ox, oy, oz] = origin;
+  [ox + (r[0] - ox) * cos, oy + (r[1] - oy) * cos, oz + (r[2] - oz) * cos]
 }
 
 // Face vertices and inward shift
@@ -221,7 +233,7 @@ fn shift_face_inward(vertices: &mut [[f32; 3]; 4], dir: FaceDir, from: [f32; 3],
 
 // Public entry point
 
-pub fn build_quads(model_name: &str, jar: &mut Jar) -> Result<Vec<Quad>> {
+pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32) -> Result<Vec<Quad>> {
   let (textures, elements) = resolve_model(model_name, jar)?;
   let mut quads = Vec::new();
 
@@ -259,6 +271,41 @@ pub fn build_quads(model_name: &str, jar: &mut Jar) -> Result<Vec<Quad>> {
         }
       }
 
+      // Zero-thickness quads at integer voxel boundaries fail the strict SAT test:
+      // a plane at y=0 projects to [0,0] on Y; voxel 0 projects to [0,1]; 0<0 is false.
+      // After rotation, if all vertices still share the same face-axis coordinate at an
+      // integer position, nudge 0.5 into the nearest voxel so the SAT test can find it.
+      // Cross model quads (rotated 45°) have varying face-axis coords → no nudge.
+      let face_axis = match dir {
+        FaceDir::North | FaceDir::South => 2,
+        FaceDir::East  | FaceDir::West  => 0,
+        FaceDir::Up    | FaceDir::Down  => 1,
+      };
+      let zero_thickness = match dir {
+        FaceDir::North | FaceDir::South => (to[2] - from[2]).abs() < 0.0001,
+        FaceDir::East  | FaceDir::West  => (to[0] - from[0]).abs() < 0.0001,
+        FaceDir::Up    | FaceDir::Down  => (to[1] - from[1]).abs() < 0.0001,
+      };
+      if zero_thickness {
+        let pos = verts[0][face_axis];
+        if verts.iter().all(|v| (v[face_axis] - pos).abs() < 0.001)
+           && (pos - pos.round()).abs() < 0.001
+        {
+          let voxel = ((pos - 0.5).floor() as i32).clamp(0, 15);
+          let nudge = (voxel as f32 + 0.5) - pos;
+          for v in verts.iter_mut() { v[face_axis] += nudge; }
+        }
+      }
+
+      // Apply blockstate variant rotation around block center (8,8,8): Y axis first, then X.
+      let bs_origin = [8.0f32, 8.0, 8.0];
+      if bs_y_rot != 0 {
+        for v in verts.iter_mut() { *v = rotate_point(*v, bs_origin, "y", bs_y_rot as f32, false); }
+      }
+      if bs_x_rot != 0 {
+        for v in verts.iter_mut() { *v = rotate_point(*v, bs_origin, "x", bs_x_rot as f32, false); }
+      }
+
       quads.push(Quad {
         vertices: verts,
         texture,
@@ -269,6 +316,8 @@ pub fn build_quads(model_name: &str, jar: &mut Jar) -> Result<Vec<Quad>> {
         elem_to: to,
         elem_rot: elem_rot.clone(),
         tint: raw_face.tintindex.unwrap_or(-1),
+        bs_x_rot,
+        bs_y_rot,
       });
     }
   }
@@ -306,7 +355,7 @@ pub fn sample_uv(
   let (lerp_x, lerp_y) = match dir {
     FaceDir::East => (inv_lerp(z1, z0, z), inv_lerp(y1, y0, y)),
     FaceDir::West => (inv_lerp(z0, z1, z), inv_lerp(y1, y0, y)),
-    FaceDir::Up  => (inv_lerp(x0, x1, x), inv_lerp(z0, z1, z)),
+    FaceDir::Up   => (inv_lerp(x0, x1, x), inv_lerp(z0, z1, z)),
     FaceDir::Down => (inv_lerp(x0, x1, x), inv_lerp(z1, z0, z)),
     FaceDir::South => (inv_lerp(x0, x1, x), inv_lerp(y1, y0, y)),
     FaceDir::North => (inv_lerp(x1, x0, x), inv_lerp(y1, y0, y)),

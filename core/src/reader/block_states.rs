@@ -63,4 +63,10 @@ impl BlockStateTable {
     }
     result
   }
+
+  /// Look up a block state by its already-formatted key string (e.g. "stone" or
+  /// "oak_stairs[facing=east,half=bottom,shape=straight,waterlogged=false]").
+  pub fn lookup(&self, key: &str) -> Option<u16> {
+    self.map.get(key).copied()
+  }
 }

@@ -1,29 +1,19 @@
-/// Serialize a voxelized brick into the materials.bin entry format.
+/// Serialize the color portion of a voxelized brick for materials.bin.
 ///
-/// Format per entry (from README):
-///  [512 bytes] geometry bitmask (4096 bits)
-///  [8 bytes]  coarse bitmask (64 bits)
+/// Format per entry:
 ///  [4 bytes]  meta: palette_count(8b) | solid_voxel_count(16b) | reserved(8b)
 ///  [N*4 bytes] palette (RGBA, up to 256 entries)
 ///  [M bytes]  indices (8-bit palette index per solid voxel, popcount-indexed)
+///
+/// Geometry (bitmask + coarse) is written separately to geometry.bin.
 
 use super::voxelizer::VoxelGrid;
 
-pub fn serialize_brick(grid: &VoxelGrid) -> Vec<u8> {
-  let solid_count = grid.color_indices.len() as u32;
+pub fn serialize_color_data(grid: &VoxelGrid) -> Vec<u8> {
+  let solid_count   = grid.color_indices.len() as u32;
   let palette_count = grid.palette.colors.len() as u32;
 
-  let mut out = Vec::with_capacity(
-    512 + 8 + 4 + palette_count as usize * 4 + solid_count as usize
-  );
-
-  // Geometry bitmask (512 bytes = 128 × u32, little-endian).
-  for word in &grid.bitmask {
-    out.extend_from_slice(&word.to_le_bytes());
-  }
-
-  // Coarse bitmask (8 bytes).
-  out.extend_from_slice(&grid.coarse.to_le_bytes());
+  let mut out = Vec::with_capacity(4 + palette_count as usize * 4 + solid_count as usize);
 
   // Meta word: palette_count (bits 31-24) | solid_count (bits 23-8) | reserved (bits 7-0).
   let meta = ((palette_count & 0xFF) << 24) | ((solid_count & 0xFFFF) << 8);

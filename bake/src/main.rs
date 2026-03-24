@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -6,10 +6,8 @@ use serde::Deserialize;
 use anyhow::Result;
 use chisel_core::reader::block_states::{build_block_key, BlockStateTable};
 use chisel_core::carver;
-use chisel_core::carver::jar::Jar;
-use chisel_core::carver::model::build_quads;
-use chisel_core::carver::texture::load_texture;
-use chisel_core::carver::voxelizer::{voxelize, VoxelGrid};
+use chisel_core::carver::texture::Palette;
+use chisel_core::carver::voxelizer::VoxelGrid;
 
 #[derive(Deserialize)]
 struct BlockEntry {
@@ -33,8 +31,7 @@ fn main() -> Result<()> {
       .ok_or_else(|| anyhow::anyhow!("--export-vox requires a block state key, e.g. \"dark_oak_log[axis=x]\""))?;
     let default_out = format!("{}.vox", key.replace(['[', ']', '=', ','], "_"));
     let out_path = args.get(pos + 2).map(String::as_str).unwrap_or(&default_out);
-    let client_jar = Path::new("jars/client.jar").canonicalize()?;
-    return export_vox(&client_jar, key, out_path);
+    return export_vox(key, out_path);
   }
 
   // Normal full bake.
@@ -79,7 +76,7 @@ fn main() -> Result<()> {
   println!("done ({} block states)", entries.len());
 
   print!("  [3/3] running carver... ");
-  carver::generate_materials(&client_jar, &out_dir.join("materials.bin"))?;
+  carver::generate_materials(&client_jar, &out_dir)?;
   println!("done");
 
   println!("\nall data files generated successfully.");
@@ -88,121 +85,91 @@ fn main() -> Result<()> {
 
 // ---------------------------------------------------------------------------
 // --export-vox
+// Reads from data/block_states.bin, data/geometry.bin, data/materials.bin
+// to test the full end-to-end pipeline without re-voxelizing.
 // ---------------------------------------------------------------------------
 
-fn export_vox(client_jar: &Path, block_state_key: &str, out_path: &str) -> Result<()> {
-  println!("JAR:   {:?}", client_jar);
-  println!("block: {}", block_state_key);
-
-  let mut jar = Jar::open(client_jar)?;
-
-  // Parse "dark_oak_log[axis=x]" -> name="dark_oak_log", props={axis:x}
-  let (short_name, props) = parse_key(block_state_key);
-
-  // Look up which model to use from the blockstate JSON.
-  let model_name = find_model_name(short_name, &props, &mut jar)?
-    .ok_or_else(|| anyhow::anyhow!("no blockstate JSON found for '{short_name}'"))?;
-  println!("model: {}", model_name);
-
-  let quads = build_quads(&model_name, &mut jar)?;
-  println!("quads: {}", quads.len());
-
-  let mut textures = HashMap::new();
-  for q in &quads {
-    if !textures.contains_key(&q.texture) {
-      match load_texture(&q.texture, &mut jar) {
-        Ok(img) => { textures.insert(q.texture.clone(), img); }
-        Err(e)  => eprintln!("  warn: texture '{}' failed: {:?}", q.texture, e),
-      }
-    }
+/// Normalize a block state key so properties are sorted alphabetically,
+/// matching the format stored in block_states.bin.
+fn normalize_key(key: &str) -> String {
+  if let Some(bracket) = key.find('[') {
+    let name = &key[..bracket];
+    let props_str = &key[bracket+1..key.len()-1];
+    let props: BTreeMap<String, String> = props_str.split(',')
+      .filter_map(|kv| { let mut it = kv.splitn(2, '='); Some((it.next()?.to_string(), it.next()?.to_string())) })
+      .collect();
+    build_block_key(name, &props)
+  } else {
+    key.to_string()
   }
-  println!("textures: {}", textures.len());
+}
 
-  let grid = voxelize(&quads, &textures);
-  let solid: u32 = grid.bitmask.iter().map(|w| w.count_ones()).sum();
-  println!("solid voxels: {solid}  palette colors: {}", grid.palette.colors.len());
+fn export_vox(block_state_key: &str, out_path: &str) -> Result<()> {
+  let key = normalize_key(block_state_key);
 
+  // block_states.bin → block state ID
+  let bs_data = fs::read("data/block_states.bin")?;
+  let bs_table = BlockStateTable::load(&bs_data);
+  let block_id = bs_table.lookup(&key)
+    .ok_or_else(|| anyhow::anyhow!("block state not found: {key}"))?;
+  println!("block: {key}  id={block_id}");
+
+  // geometry.bin → bitmask + coarse
+  let geom = fs::read("data/geometry.bin")?;
+  anyhow::ensure!(&geom[0..4] == b"GEOM", "bad geometry.bin magic");
+  let count      = u32::from_le_bytes(geom[4..8].try_into()?)   as usize;
+  let bitmask_id = u16::from_le_bytes(geom[12 + block_id as usize * 2..][..2].try_into()?) as usize;
+  let shape_base = 12 + count * 2 + bitmask_id * 520;
+  let coarse     = u64::from_le_bytes(geom[shape_base..][..8].try_into()?);
+  let mut bitmask = [0u32; 128];
+  for (i, w) in bitmask.iter_mut().enumerate() {
+    *w = u32::from_le_bytes(geom[shape_base + 8 + i*4..][..4].try_into()?);
+  }
+  let solid: u32 = bitmask.iter().map(|w| w.count_ones()).sum();
+  println!("shape id={bitmask_id}  solid={solid}");
+
+  // materials.bin → palette + color indices
+  let mat = fs::read("data/materials.bin")?;
+  anyhow::ensure!(&mat[0..4] == b"MATL", "bad materials.bin magic");
+  let mat_count    = u32::from_le_bytes(mat[4..8].try_into()?)   as usize;
+  let num_payloads = u32::from_le_bytes(mat[8..12].try_into()?)  as usize;
+  let color_ids_base      = 12;
+  let payload_offsets_base = color_ids_base + mat_count * 2;
+  let payload_data_base    = payload_offsets_base + num_payloads * 4;
+
+  let color_id = u16::from_le_bytes(
+    mat[color_ids_base + block_id as usize * 2..][..2].try_into()?
+  ) as usize;
+
+  let (palette, color_indices) = if color_id == 0 {
+    (Palette::default(), Vec::new())
+  } else {
+    let payload_off = u32::from_le_bytes(
+      mat[payload_offsets_base + (color_id - 1) * 4..][..4].try_into()?
+    ) as usize;
+    let p = payload_data_base + payload_off;
+
+    let meta          = u32::from_le_bytes(mat[p..][..4].try_into()?);
+    let mut pal_count = ((meta >> 24) & 0xFF) as usize;
+    let solid_count   = ((meta >> 8) & 0xFFFF) as usize;
+    if solid_count > 0 && pal_count == 0 { pal_count = 256; }
+
+    let mut palette = Palette::default();
+    let pal_base = p + 4;
+    for i in 0..pal_count {
+      let o = pal_base + i * 4;
+      palette.get_or_insert([mat[o], mat[o+1], mat[o+2], mat[o+3]]);
+    }
+    let idx_base = pal_base + pal_count * 4;
+    (palette, mat[idx_base..idx_base + solid_count].to_vec())
+  };
+  println!("color_id={color_id}  palette={} colors  indices={}", palette.colors.len(), color_indices.len());
+
+  let grid = VoxelGrid { bitmask, coarse, color_indices, palette };
   let bytes = write_vox(&grid);
   fs::write(out_path, &bytes)?;
   println!("wrote {out_path}");
   Ok(())
-}
-
-fn parse_key(key: &str) -> (&str, HashMap<&str, &str>) {
-  if let Some(bracket) = key.find('[') {
-    let name = &key[..bracket];
-    let props_str = &key[bracket+1..key.len()-1];
-    let props = props_str.split(',')
-      .filter_map(|kv| { let mut it = kv.splitn(2, '='); Some((it.next()?, it.next()?)) })
-      .collect();
-    (name, props)
-  } else {
-    (key, HashMap::new())
-  }
-}
-
-fn find_model_name(
-  short_name: &str,
-  props: &HashMap<&str, &str>,
-  jar: &mut Jar,
-) -> Result<Option<String>> {
-  use serde::Deserialize;
-
-  #[derive(Deserialize)]
-  #[serde(untagged)]
-  enum Apply { Single(Variant), List(Vec<Variant>) }
-
-  #[derive(Deserialize)]
-  struct Variant { model: String }
-
-  #[derive(Deserialize)]
-  struct Bs {
-    #[serde(default)] variants: HashMap<String, Apply>,
-    #[serde(default)] multipart: Vec<MpEntry>,
-  }
-
-  #[derive(Deserialize)]
-  struct MpEntry { apply: Apply }
-
-  let path = format!("assets/minecraft/blockstates/{short_name}.json");
-  let bytes = match jar.get(&path)? { Some(b) => b, None => return Ok(None) };
-  let bs: Bs = serde_json::from_slice(&bytes)?;
-
-  let model_str = |a: &Apply| -> String {
-    match a {
-      Apply::Single(v) => v.model.trim_start_matches("minecraft:").to_owned(),
-      Apply::List(l)   => l.first().map(|v| v.model.trim_start_matches("minecraft:").to_owned()).unwrap_or_default(),
-    }
-  };
-
-  if !bs.variants.is_empty() {
-    // Single-variant blockstates (e.g. stone) have key "".
-    if bs.variants.len() == 1 {
-      return Ok(bs.variants.values().next().map(model_str));
-    }
-    let mut best: Option<&Apply> = None;
-    let mut best_score = 0usize;
-    for (key, apply) in &bs.variants {
-      if key.is_empty() { if best_score == 0 { best = Some(apply); } continue; }
-      let mut score = 0usize;
-      let mut all = true;
-      for part in key.split(',') {
-        let mut kv = part.splitn(2, '=');
-        match (kv.next(), kv.next()) {
-          (Some(k), Some(v)) => { if props.get(k) == Some(&v) { score += 1; } else { all = false; break; } }
-          _ => { all = false; break; }
-        }
-      }
-      if all && score > best_score { best_score = score; best = Some(apply); }
-    }
-    return Ok(best.map(model_str));
-  }
-
-  if let Some(first) = bs.multipart.first() {
-    return Ok(Some(model_str(&first.apply)));
-  }
-
-  Ok(None)
 }
 
 // ---------------------------------------------------------------------------

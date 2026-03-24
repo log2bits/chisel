@@ -42,9 +42,9 @@ Chisel is split into two separate programs with a `.chisel` file as the handoff 
 So the workflow is:
 
 ```
-[chisel-bake]   Minecraft jars -> block_states.bin + materials.bin  (run once per MC version)
-[chisel-pack]   world.zip + materials.bin -> world.chisel            (run once per world)
-[chisel-render] world.chisel -> frames                               (runs in browser or native)
+[chisel-bake]   Minecraft jars -> block_states.bin + geometry.bin + materials.bin  (run once per MC version)
+[chisel-pack]   world.zip + geometry.bin + materials.bin -> world.chisel            (run once per world)
+[chisel-render] world.chisel -> frames                                              (runs in browser or native)
 ```
 
 ---
@@ -72,7 +72,7 @@ world.zip
 The pipeline inside chisel-render:
 
 ```
-world.chisel + materials.bin
+world.chisel + geometry.bin + materials.bin
     |
     v
   [ Loader ]
@@ -93,14 +93,14 @@ Minecraft client jar
   [ Carver ]  (inside chisel-bake, run once per MC version)
     Loads models + textures from the client jar,
     voxelizes every block state into a 16x16x16 brick,
-    writes materials.bin.
+    writes geometry.bin + materials.bin.
 ```
 
 ---
 
 ## Static Data Files
 
-Two binary files live in `data/` and are produced by `chisel-bake`. They're committed to the repo and only need to be regenerated when the Minecraft version changes.
+Three binary files live in `data/` and are produced by `chisel-bake`. They're committed to the repo and only need to be regenerated when the Minecraft version changes.
 
 ### block_states.bin
 
@@ -116,52 +116,86 @@ for each entry:
   [n bytes]  utf8 key string
 ```
 
-The key string format is `"minecraft:block_name"` for blocks with no properties, or `"minecraft:block_name[prop1=val1,prop2=val2]"` with properties sorted alphabetically.
+The key string format is `"block_name"` for blocks with no properties, or `"block_name[prop1=val1,prop2=val2]"` with properties sorted alphabetically. The `minecraft:` namespace prefix is stripped.
 
 Measured from Minecraft 1.21.11: 29,671 total block states. A u16 is sufficient with headroom. `BlockStateId = 0` is reserved for air.
 
 File size: ~2.4 MB.
 
-### materials.bin
+### geometry.bin
 
-Maps every u16 BlockStateId to a voxelized 16x16x16 brick with geometry and palette-compressed color. Used by the Loader to upload material data to the GPU. Stays in VRAM for the entire session.
+Maps every u16 BlockStateId to a deduplicated voxel geometry shape. The geometry section is the hot path during ray traversal and is sized to fit in GPU L2 cache.
 
-The IDs in `block_states.bin` and `materials.bin` are derived from the same `blocks.json` and always match as long as both are generated together by `chisel-bake`.
+Bitmask shapes are deduplicated across all block states: 29,671 block states collapse to ~407 unique shapes. Many blocks share the same 16x16x16 geometry (e.g. all fully-solid blocks share one all-ones bitmask).
 
 Format:
 ```
-[4 bytes]  magic
-[4 bytes]  u32 entry count
-for each entry (indexed by BlockStateId):
-  [512 bytes]  geometry bitmask (4096 bits, one per voxel)
-  [8 bytes]    coarse bitmask (64 bits, one per 4x4x4 sub-region)
-  [1 u32]      meta: palette_count (8 bits) | solid_voxel_count (16 bits) | reserved (8 bits)
-  [N * 4 bytes] palette: RGBA entries, N = unique colors (1-256, always <= 219 in practice)
-  [M bytes]    indices: 8-bit palette index per solid voxel
+[4 bytes]             magic "GEOM"
+[4 bytes]             u32 count (number of block state slots = max_id + 1)
+[4 bytes]             u32 num_shapes (number of unique bitmask shapes)
+[count * 2 bytes]     u16 bitmask_id per block state (index into shape table)
+[num_shapes * 520 bytes]  shape table, each entry:
+  [8 bytes]   coarse bitmask (u64, one bit per 4x4x4 sub-region)
+  [512 bytes] geometry bitmask (4096 bits, one per voxel)
 ```
 
-Material data is stored only for solid voxels. The index into the material array for a given voxel is computed via popcount on the geometry bitmask up to that voxel's position.
+GPU lookup:
+```
+bitmask_id = bitmask_ids[block_state_id]        // ~58 KB, fits in L1
+shape      = shape_table[bitmask_id]            // ~203 KB, fits in L2
+coarse     = shape.coarse
+bitmask    = shape.bitmask
+```
 
-Bitmask indexing:
+Bitmask bit indexing:
 ```
 flat_idx = x + y*16 + z*256
 word:  bitmask[flat_idx / 32]
 bit:   (word >> (flat_idx % 32)) & 1
 ```
 
-Memory estimate:
-```
-29,671 entries worst case (one per block state)
-Per entry average:
-  Geometry bitmask:                512 bytes
-  Coarse bitmask:                    8 bytes
-  Palette (~20 colors * 4 RGBA):    80 bytes
-  Material indices (~800 voxels):  800 bytes
-  Meta + overhead:                   8 bytes
-  Total per entry: ~1.4 KB
+Total size: ~261 KB.
 
-29,671 * 1.4 KB = ~41 MB average
-Realistic: ~40-55 MB
+### materials.bin
+
+Maps every u16 BlockStateId to palette-compressed color data for its solid voxels. This is the cold path — accessed only when a ray hits a block. Geometry (bitmask/coarse) is in geometry.bin.
+
+The IDs in `block_states.bin`, `geometry.bin`, and `materials.bin` are derived from the same `blocks.json` and always match as long as all three are generated together by `chisel-bake`.
+
+Color payloads are deduplicated across all block states: 26,756 non-empty block states collapse to ~4,332 unique color payloads. Many block states share identical visual data despite having different behavioral properties (e.g. all redstone power levels, all note block instrument/note combinations, all waterlogged variants of the same block type). This mirrors the bitmask deduplication in geometry.bin.
+
+Color_id 0 is a sentinel meaning "no color data" (empty/air block). Valid color_ids are 1..=num_payloads.
+
+Format:
+```
+[4 bytes]              magic "MATL"
+[4 bytes]              u32 count (number of block state slots = max_id + 1)
+[4 bytes]              u32 num_payloads (number of unique color payloads)
+[count * 2 bytes]      color_id per block state (u16, 0 = no color data)
+[num_payloads * 4 bytes] payload byte offsets (u32, from start of payload data section)
+[variable]             payload data, one entry per unique payload:
+  [4 bytes]              meta: palette_count (8 bits) | solid_voxel_count (16 bits) | reserved (8 bits)
+  [N * 4 bytes]          palette: RGBA8 entries, N = unique colors (1–256)
+  [M bytes]              indices: 8-bit palette index per solid voxel, in popcount order
+```
+
+GPU lookup:
+```
+color_id      = color_ids[block_state_id]         // ~58 KB, fits in L1
+payload_off   = payload_offsets[color_id - 1]     // ~17 KB for ~4K payloads
+payload       = payload_data[payload_off..]        // palette + indices
+```
+
+Color indices are stored only for solid voxels. The index into the color array for a given voxel is computed via popcount on the geometry bitmask up to that voxel's position.
+
+Measured from Minecraft 1.21.11:
+```
+26,756 non-empty block states
+ 4,332 unique color payloads (after deduplication)
+17,705 unique RGBA colors across all voxelized blocks
+Total payload data:    ~3.97 MB
+Total materials.bin:   ~4.02 MB (was ~20.2 MB without deduplication)
+Savings:               ~16.2 MB (80% reduction)
 ```
 
 ---
@@ -178,7 +212,7 @@ It does three things in order:
 
 1. Runs the Minecraft data generator via subprocess (`java -DbundlerMainClass=net.minecraft.data.Main`) to produce `blocks.json`, then deletes the temp files.
 2. Parses `blocks.json` and writes `data/block_states.bin`.
-3. Runs the Carver against the client jar to produce `data/materials.bin`.
+3. Runs the Carver against the client jar to produce `data/geometry.bin` and `data/materials.bin`.
 
 All output goes to `data/`. All temp files are cleaned up automatically.
 
@@ -234,7 +268,7 @@ DataVersion 2564+ (1.16+):
 
 Regardless of input version, all blocks are normalized to a `BlockStateId` (u16) by looking them up in a `BlockStateTable` loaded from `data/block_states.bin`. The table maps canonical key strings to IDs.
 
-Key string format: `"minecraft:stone"` for blocks with no properties, `"minecraft:acacia_button[face=floor,facing=north,powered=true]"` with properties sorted alphabetically.
+Key string format: `"stone"` for blocks with no properties, `"acacia_button[face=floor,facing=north,powered=true]"` with properties sorted alphabetically. The `minecraft:` namespace prefix is stripped.
 
 The `build_block_key(name, properties)` function in `block_state.rs` is public and used by both the Reader and `chisel-bake` to build these strings consistently.
 
@@ -252,13 +286,13 @@ The Carver uses a quad-intersection approach.
 
 **2. Resolve the model.** Parse the blockstate JSON to find which model file applies. Follow the parent chain (most models inherit from a parent like `block/cube_all`) until you have a complete set of elements with all texture variables resolved. Texture variables like `#side` get substituted through the model's `textures` map.
 
-**3. Decompose into quads.** Each element in the model JSON is a rectangular prism with a `from` and `to` in 0-16 unit space. Generate 6 quads per prism (one per face), then shift each quad inward by 0.5 voxels toward the prism center so it properly intersects the shell voxels rather than sitting exactly on the boundary. Zero-thickness quads (like grass cross-planes) are used as-is.
+**3. Decompose into quads.** Each element in the model JSON is a rectangular prism with a `from` and `to` in 0–16 unit space. Generate up to 6 quads per prism (one per face). For volumetric faces, shift each quad 0.5 units inward toward the prism center and trim 0.5 units from all four edges in the face plane, so the quad strictly intersects the shell voxels' interiors rather than touching boundaries. Zero-thickness quads (like the grass cross-plane) skip the shift and trim. Flat ground quads sitting exactly on an integer voxel boundary (like rails at y=1) are nudged 0.5 units into the nearest voxel so the intersection test can find them.
 
-**4. Test every voxel.** Loop through all 4096 voxels. For each voxel, check if any quads pass through its volume. A quad that only touches a face or edge without entering the interior doesn't count.
+**4. Intersect quad-major.** For each quad, compute its voxel bounding box and test only the voxels within it using a full SAT (Separating Axis Theorem) intersection test. Strict intersection only — a quad touching a voxel face or edge without entering its interior doesn't count. This visits far fewer voxels than looping all 4096 for every quad.
 
-**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad, use the model's UV coordinates to look up the texture color, and average all the sampled colors if multiple quads intersect.
+**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad's element plane (applying any element rotation in reverse), use the model's UV coordinates to look up the nearest texture pixel, and average all sampled RGBA values if multiple quads hit the same voxel. Transparent pixels (alpha = 0) are skipped entirely.
 
-**6. Snap to palette.** Find the nearest palette color to the averaged result. That index becomes the voxel's material value.
+**6. Snap to palette.** Find the nearest palette color to the averaged RGBA result. That index becomes the voxel's material value.
 
 Interior voxels that no quad passes through stay empty. A full solid cube ends up with roughly 1,352 solid voxels out of 4,096, which falls out of the algorithm for free.
 
@@ -381,38 +415,39 @@ The Loader takes the `.chisel` file and `materials.bin` and uploads everything i
 ### GPU Buffers
 
 ```
-svo_nodes       : array<SvoNode>   // 28 bytes each (geometry + face colors)
-child_ids       : array<u32>       // branch child node indices
-leaf_data       : array<u32>       // u16 block_state_ids packed 2 per u32
-chunk_roots     : array<ChunkRoot> // one per loaded chunk
-block_geometry  : array<u32>       // 128+2 u32s per entry (512 byte bitmask + coarse)
-block_material  : array<u32>       // variable layout per entry
-block_offsets   : array<u32>       // per-entry byte offset into block_material
-block_meta      : array<u32>       // per-entry flags
+svo_nodes        : array<SvoNode>   // 28 bytes each (geometry + face colors)
+child_ids        : array<u32>       // branch child node indices
+leaf_data        : array<u32>       // u16 block_state_ids packed 2 per u32
+chunk_roots      : array<ChunkRoot> // one per loaded chunk
+bitmask_ids      : array<u16>       // shape index per block state (~58 KB, fits in L1)
+shape_table      : array<u32>       // unique bitmask shapes: coarse(2u32) + bitmask(128u32) each (~203 KB, fits in L2)
+color_ids        : array<u16>       // payload index per block state (~58 KB, fits in L1)
+payload_offsets  : array<u32>       // byte offset into payload_data per unique payload (~17 KB)
+payload_data     : array<u32>       // deduplicated palette + indices (~4 MB, cold path)
 ```
 
 WGSL bindings:
 ```wgsl
-@group(0) @binding(0) var<storage, read> svo_nodes:      array<SvoNode>;
-@group(0) @binding(1) var<storage, read> child_ids:      array<u32>;
-@group(0) @binding(2) var<storage, read> leaf_data:      array<u32>;
-@group(0) @binding(3) var<storage, read> chunk_roots:    array<ChunkRoot>;
-@group(0) @binding(4) var<storage, read> block_geometry: array<u32>;
-@group(0) @binding(5) var<storage, read> block_material: array<u32>;
-@group(0) @binding(6) var<storage, read> block_offsets:  array<u32>;
-@group(0) @binding(7) var<storage, read> block_meta:     array<u32>;
+@group(0) @binding(0) var<storage, read> svo_nodes:       array<SvoNode>;
+@group(0) @binding(1) var<storage, read> child_ids:       array<u32>;
+@group(0) @binding(2) var<storage, read> leaf_data:       array<u32>;
+@group(0) @binding(3) var<storage, read> chunk_roots:     array<ChunkRoot>;
+@group(0) @binding(4) var<storage, read> bitmask_ids:     array<u32>; // u16 packed
+@group(0) @binding(5) var<storage, read> shape_table:     array<u32>;
+@group(0) @binding(6) var<storage, read> color_ids:       array<u32>; // u16 packed
+@group(0) @binding(7) var<storage, read> payload_offsets: array<u32>;
+@group(0) @binding(8) var<storage, read> payload_data:    array<u32>;
 ```
 
 ### Memory Budget (approximate, 512x384x512 block region)
 
-| Structure                    | Size estimate  |
-|------------------------------|----------------|
-| SVDAG nodes (post-DAG)       | 8-60 MB        |
-| child_ids + leaf_data        | 4-20 MB        |
-| Block geometry bitmasks      | ~8 MB          |
-| Block material data          | ~45 MB         |
-| Block meta + offsets         | < 1 MB         |
-| **Total**                    | **~65-135 MB** |
+| Structure                               | Size estimate  |
+|-----------------------------------------|----------------|
+| SVDAG nodes (post-DAG)                  | 8–60 MB        |
+| child_ids + leaf_data                   | 4–20 MB        |
+| bitmask_ids + shape_table               | ~261 KB        |
+| color_ids + payload_offsets + payloads  | ~4 MB          |
+| **Total**                               | **~16–84 MB**  |
 
 The range is wide because compression ratio depends heavily on world content. A generated vanilla world compresses much more than a dense player-built structure.
 
@@ -458,7 +493,7 @@ Primary visibility plus hard shadow rays. Sun directional light with basic Lambe
 
 **Pre-1.13 world support.** The Reader currently handles 1.13+. Pre-flattening worlds (1.12 and earlier) need a static (block_id, metadata) -> modern block state string lookup table in `legacy.rs`.
 
-**Transparent block rendering.** Alpha values are stored in the palette (RGBA), but the ray caster currently treats all hits as opaque.
+**Transparent block rendering.** Alpha is sampled from textures and averaged per voxel just like RGB. The ray caster currently treats all hits as opaque and needs to be updated to use the alpha channel.
 
 **Biome tinting.** Grass, leaves, and water change color per biome. The Carver currently bakes a single default color.
 
@@ -466,7 +501,7 @@ Primary visibility plus hard shadow rays. Sun directional light with basic Lambe
 
 **Chunk streaming.** For worlds larger than VRAM, top SVDAG levels stay resident while leaf chunks stream in and out as the camera moves.
 
-**Multithreading in chisel-pack.** The Reader and Packer both process region files independently. Parallelism with rayon on the native build path is planned but not yet implemented.
+**Multithreading in chisel-pack.** The Reader and Packer both process region files independently. Parallelism with rayon on the native build path is planned but not yet implemented. (chisel-bake's Carver already uses rayon with per-thread JAR handles and texture caches.)
 
 ---
 
@@ -478,6 +513,7 @@ chisel/
 
   data/
     block_states.bin      # generated by chisel-bake, committed to repo
+    geometry.bin          # generated by chisel-bake, committed to repo
     materials.bin         # generated by chisel-bake, committed to repo
 
   jars/                   # gitignored
@@ -501,11 +537,12 @@ chisel/
         legacy.rs         # pre-1.13 numeric ID + metadata mapping (TODO)
 
       carver/
-        mod.rs            # generate_materials entry point
-        model.rs          # model JSON parsing, parent chain resolution, texture var substitution
-        texture.rs        # texture loading from client jar, palette extraction
-        voxelizer.rs      # quad generation, intersection testing, color sampling
-        brick.rs          # final 16x16x16 bitmask + material entry output
+        mod.rs            # generate_materials entry point; writes geometry.bin + materials.bin
+        jar.rs            # ZIP/JAR reader with entry caching
+        model.rs          # model JSON parsing, parent chain resolution, quad generation
+        texture.rs        # texture loading, per-brick palette, color sampling
+        voxelizer.rs      # quad-major SAT intersection, color accumulation, VoxelGrid output
+        brick.rs          # serialize color data (palette + indices) for materials.bin
 
       packer/
         mod.rs
@@ -541,7 +578,8 @@ chisel/
   bake/
     Cargo.toml
     src/
-      main.rs             # chisel-bake entry point (jars -> block_states.bin + materials.bin)
+      main.rs             # chisel-bake entry point (jars -> block_states.bin + geometry.bin + materials.bin)
+                          # also: --export-vox "block_state_key" reads from data/*.bin to test end-to-end
 
   shaders/
     common.wgsl           # shared structs, math utilities
