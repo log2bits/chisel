@@ -1,8 +1,8 @@
-/// Minecraft block model parsing, parent-chain resolution, and quad generation.
-///
-/// The UV conventions and face-direction mappings here are taken directly from
-/// Blockbench's `CubeFace.UVToLocal()` (js/outliner/cube.js), which is the
-/// reference implementation for how Minecraft renders block models.
+// Minecraft block model parsing, parent-chain resolution, and quad generation.
+//
+// The UV conventions and face-direction mappings here are taken directly from
+// Blockbench's `CubeFace.UVToLocal()` (js/outliner/cube.js), which is the
+// reference implementation for how Minecraft renders block models.
 
 use std::collections::HashMap;
 
@@ -52,7 +52,7 @@ struct RawFace {
 
 // Resolved types
 
-/// A face direction, matching Minecraft / Blockbench conventions.
+// A face direction, matching Minecraft / Blockbench conventions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceDir { North, South, East, West, Up, Down }
 
@@ -70,7 +70,7 @@ impl FaceDir {
   }
 }
 
-/// A single quad ready for voxelization.
+// A single quad ready for voxelization.
 pub struct Quad {
   pub vertices: [[f32; 3]; 4],
   pub texture: String,
@@ -80,11 +80,11 @@ pub struct Quad {
   pub elem_from: [f32; 3],
   pub elem_to: [f32; 3],
   pub elem_rot: Option<ElemRotation>,
-  /// Biome tint color to multiply into this quad's texture, or None for no tint.
-  /// Only set when the face has a tintindex in the model JSON.
+  // Biome tint color to multiply into this quad's texture, or None for no tint.
+  // Only set when the face has a tintindex in the model JSON.
   pub tint_color: Option<[u8; 3]>,
-  /// Blockstate variant rotation (degrees, multiples of 90).
-  /// Applied Y-axis first, then X-axis, around block center (8,8,8).
+  // Blockstate variant rotation (degrees, multiples of 90).
+  // Applied Y-axis first, then X-axis, around block center (8,8,8).
   pub bs_x_rot: u32,
   pub bs_y_rot: u32,
 }
@@ -235,8 +235,8 @@ fn shift_face_inward(vertices: &mut [[f32; 3]; 4], dir: FaceDir, from: [f32; 3],
 
 // Public entry point
 
-/// Build all quads for a block model. `tint_color` is applied to any quad
-/// that has a `tintindex` in the model JSON (biome-dependent coloring).
+// Build all quads for a block model. `tint_color` is applied to any quad
+// that has a `tintindex` in the model JSON (biome-dependent coloring).
 pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32, tint_color: [u8; 3]) -> Result<Vec<Quad>> {
   let (textures, elements) = resolve_model(model_name, jar)?;
   let mut quads = Vec::new();

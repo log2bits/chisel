@@ -1,7 +1,7 @@
-/// Blockstate JSON parsing and model resolution.
-///
-/// Reads blockstate JSON files from the client JAR and resolves which model
-/// (with blockstate x/y rotation) applies for a given set of block properties.
+// Blockstate JSON parsing and model resolution.
+//
+// Reads blockstate JSON files from the client JAR and resolves which model
+// (with blockstate x/y rotation) applies for a given set of block properties.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,8 +12,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::jar::Jar;
-
-// ── Serde types ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -37,16 +35,14 @@ struct BlockstateJson {
 
 #[derive(Deserialize)]
 struct MultipartEntry {
-  /// Absent means "always apply". Present is either a flat condition map or
-  /// `{ "OR": [...] }` with a list of alternative condition maps.
+  // Absent means "always apply". Present is either a flat condition map or
+  // `{ "OR": [...] }` with a list of alternative condition maps.
   #[serde(default)]
   when: Option<Value>,
   apply: Apply,
 }
 
-// ── block_states.bin reader ───────────────────────────────────────────────────
-
-/// Read `block_states.bin` and return `(id, key)` pairs for every block state.
+// Read `block_states.bin` and return `(id, key)` pairs for every block state.
 pub fn load_entries(path: &Path) -> Result<Vec<(u16, String)>> {
   let data = fs::read(path).with_context(|| format!("reading {path:?}"))?;
   let magic = u32::from_le_bytes(data[0..4].try_into()?);
@@ -64,7 +60,7 @@ pub fn load_entries(path: &Path) -> Result<Vec<(u16, String)>> {
   Ok(entries)
 }
 
-/// Split `"block_name[prop=val,...]"` into `(name, {prop: val})`.
+// Split `"block_name[prop=val,...]"` into `(name, {prop: val})`.
 pub fn parse_key(key: &str) -> (&str, HashMap<&str, &str>) {
   if let Some(bracket) = key.find('[') {
     let name      = &key[..bracket];
@@ -78,12 +74,12 @@ pub fn parse_key(key: &str) -> (&str, HashMap<&str, &str>) {
   }
 }
 
-/// Resolve all models `(name, x_rot, y_rot)` that apply for the given block name and properties.
-///
-/// For variant blocks: returns the single best-matching variant (or empty).
-/// For multipart blocks (fences, walls, etc.): returns every entry whose `when`
-/// condition is absent or matches the given properties. This correctly assembles
-/// multi-part models (e.g. fence post + each connected arm).
+// Resolve all models `(name, x_rot, y_rot)` that apply for the given block name and properties.
+//
+// For variant blocks: returns the single best-matching variant (or empty).
+// For multipart blocks (fences, walls, etc.): returns every entry whose `when`
+// condition is absent or matches the given properties. This correctly assembles
+// multi-part models (e.g. fence post + each connected arm).
 pub fn find_model(short_name: &str, props: &HashMap<&str, &str>, jar: &mut Jar) -> Result<Vec<(String, u32, u32)>> {
   let bs_path = format!("assets/minecraft/blockstates/{short_name}.json");
   let bytes = match jar.get(&bs_path)? { Some(b) => b, None => return Ok(vec![]) };
@@ -101,8 +97,6 @@ pub fn find_model(short_name: &str, props: &HashMap<&str, &str>, jar: &mut Jar) 
   Ok(models)
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 fn model_from_apply(apply: &Apply) -> (String, u32, u32) {
   match apply {
     Apply::Single(v) => (v.model.trim_start_matches("minecraft:").to_owned(), v.x, v.y),
@@ -112,10 +106,10 @@ fn model_from_apply(apply: &Apply) -> (String, u32, u32) {
   }
 }
 
-/// Returns true if the multipart `when` value matches the given block properties.
-/// Supports `{ "OR": [...] }` (any condition set matches) and plain condition maps
-/// (all conditions must match). Property values may be pipe-separated alternatives,
-/// e.g. `"north": "low|tall"` means north=low OR north=tall.
+// Returns true if the multipart `when` value matches the given block properties.
+// Supports `{ "OR": [...] }` (any condition set matches) and plain condition maps
+// (all conditions must match). Property values may be pipe-separated alternatives,
+// e.g. `"north": "low|tall"` means north=low OR north=tall.
 fn when_matches(when: &Value, props: &HashMap<&str, &str>) -> bool {
   if let Some(or) = when.get("OR") {
     or.as_array().map_or(false, |arr| arr.iter().any(|c| conditions_match(c, props)))

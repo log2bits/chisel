@@ -23,8 +23,6 @@ payload_data_base    = payload_offsets_base + num_payloads * 4
 color_ids    = struct.unpack_from(f"<{count}H", mat, color_ids_base)
 payload_offs = struct.unpack_from(f"<{num_payloads}I", mat, payload_offsets_base)
 
-# ── Parse block_states.bin → id_to_key map ────────────────────────────────────
-
 bs_count = struct.unpack_from("<I", bs, 4)[0]
 id_to_key = {}
 cursor = 8
@@ -37,8 +35,6 @@ for _ in range(bs_count):
 
 print(f"block states: {count}")
 print()
-
-# ── Parse all bricks ──────────────────────────────────────────────────────────
 
 bricks = []  # list of (palette: list[tuple[int,int,int,int]], indices: bytes)
 
@@ -72,8 +68,6 @@ print(f"index data:                {total_idx_bytes/1024/1024:.2f} MB")
 print(f"total color data:          {current_total/1024/1024:.2f} MB  (baseline)")
 print()
 
-# ── 1. Full color-payload deduplication ───────────────────────────────────────
-
 payload_set  = {}
 dedup_bytes  = 0
 for pal, idx in bricks:
@@ -93,8 +87,6 @@ print(f"  + u16 refs:              {ref_bytes/1024:.1f} KB")
 print(f"  total:                   {dedup_total/1024/1024:.2f} MB")
 print(f"  saves:                   {(current_total - dedup_total)/1024/1024:.2f} MB")
 print()
-
-# ── 2. RLE on color indices ───────────────────────────────────────────────────
 
 def rle_size(indices):
     if not indices: return 0
@@ -117,8 +109,6 @@ print(f"  index savings:           {(total_idx_bytes - rle_idx_bytes)/1024/1024:
 print(f"  total with RLE:          {(total_pal_bytes + rle_idx_bytes)/1024/1024:.2f} MB")
 print()
 
-# ── 3. 4-bit nibble-packed indices (for bricks with ≤16 colors) ──────────────
-
 fits_16 = sum(1 for p, _ in bricks if 0 < len(p) <= 16)
 fits_32 = sum(1 for p, _ in bricks if 0 < len(p) <= 32)
 fits_64 = sum(1 for p, _ in bricks if 0 < len(p) <= 64)
@@ -136,8 +126,6 @@ print(f"  4-bit index bytes:       {idx_4bit_bytes/1024/1024:.2f} MB  (was {tota
 print(f"  index savings:           {(total_idx_bytes - idx_4bit_bytes)/1024/1024:.2f} MB")
 print(f"  total with 4-bit:        {(total_pal_bytes + idx_4bit_bytes)/1024/1024:.2f} MB")
 print()
-
-# ── 4. RLE + dedup combined ───────────────────────────────────────────────────
 
 combined_set   = {}
 combined_bytes = 0
@@ -165,8 +153,6 @@ print(f"  total:                   {combined_total/1024/1024:.2f} MB")
 print(f"  saves vs current:        {(current_total - combined_total)/1024/1024:.2f} MB")
 print()
 
-# ── 5. Palette size distribution ─────────────────────────────────────────────
-
 dist = collections.Counter(len(p) for p, _ in bricks if p)
 print(f"--- 5. palette size distribution ---")
 buckets = [(1,1),(2,4),(5,8),(9,16),(17,32),(33,64),(65,128),(129,256)]
@@ -176,8 +162,6 @@ for lo, hi in buckets:
     print(f"  {lo:>3}–{hi:<3} colors: {n:>6} bricks  {bar}")
 print()
 
-# ── 6. Voxel count distribution ──────────────────────────────────────────────
-
 vox_dist = collections.Counter(len(i) for _, i in bricks if i)
 print(f"--- 6. solid voxel count distribution ---")
 vox_buckets = [(1,100),(101,300),(301,600),(601,1000),(1001,2000),(2001,3000),(3001,4096)]
@@ -186,8 +170,6 @@ for lo, hi in vox_buckets:
     bar = "#" * (n * 40 // non_empty)
     print(f"  {lo:>4}–{hi:<4} voxels: {n:>6} bricks  {bar}")
 print()
-
-# ── 7. Dedup share-count distribution ────────────────────────────────────────
 
 # Build payload_key → list of block state keys
 payload_to_blocks = collections.defaultdict(list)
@@ -208,8 +190,6 @@ for lo, hi in share_buckets:
     print(f"  shared by {lo:>2}–{hi:<3}: {n:>5} payloads  ({total_blocks:>6} block states)")
 print()
 
-# ── 8. Alpha channel analysis ────────────────────────────────────────────────
-
 all_alpha = collections.Counter()
 for pal, _ in bricks:
     for rgba in pal:
@@ -224,8 +204,6 @@ print(f"  alpha != 255:            {non_255:,}  ({100*non_255//total_palette_ent
 if non_255 > 0:
     print(f"  non-255 alpha values:    {sorted(k for k in all_alpha if k != 255)[:20]}")
 print()
-
-# ── 9. Dedup + 4-bit combined ────────────────────────────────────────────────
 
 seen_keys_4bit = {}
 dedup_4bit_payload_bytes = 0
@@ -252,8 +230,6 @@ print(f"  total:                   {dedup_4bit_total/1024/1024:.2f} MB")
 print(f"  saves vs current:        {(current_total - dedup_4bit_total)/1024/1024:.2f} MB")
 print(f"  vs dedup alone:          {(dedup_total - dedup_4bit_total)/1024/1024:.2f} MB extra savings")
 print()
-
-# ── 10. Which blocks share each payload (sorted by share count) ───────────────
 
 print(f"--- 10. shared payload groups (most-shared first) ---")
 groups = sorted(payload_to_blocks.values(), key=len, reverse=True)

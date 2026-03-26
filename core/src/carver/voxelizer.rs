@@ -1,10 +1,10 @@
-/// Voxelizer: for each quad, iterate only over voxels in its bounding box,
-/// run a SAT intersection test, and accumulate texture colors.
-///
-/// Voxel (x, y, z) occupies AABB [x, x+1] × [y, y+1] × [z, z+1].
-/// Two accumulators are kept per voxel (tinted and untinted) so that overlay
-/// textures like grass_block's side grass are alpha-composited over the base
-/// rather than averaged with it.
+// Voxelizer: for each quad, iterate only over voxels in its bounding box,
+// run a SAT intersection test, and accumulate texture colors.
+//
+// Voxel (x, y, z) occupies AABB [x, x+1] × [y, y+1] × [z, z+1].
+// Two accumulators are kept per voxel (tinted and untinted) so that overlay
+// textures like grass_block's side grass are alpha-composited over the base
+// rather than averaged with it.
 
 use std::collections::HashMap;
 
@@ -12,8 +12,6 @@ use super::model::{FaceDir, Quad, sample_uv, unrotate_point};
 use super::texture::{RgbaImage, Palette, apply_tint, sample_texture};
 
 const WATER_TINT: [u8; 3] = [63, 118, 228]; // plains biome water color
-
-// ── SAT intersection (quad vs AABB) ──────────────────────────────────────────
 
 #[inline]
 fn sat_overlap(pts_a: &[f32], pts_b: &[f32]) -> bool {
@@ -43,7 +41,7 @@ fn project_aabb(min: [f32; 3], max: [f32; 3], axis: [f32; 3]) -> [f32; 8] {
 }
 #[inline] fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[0]-b[0], a[1]-b[1], a[2]-b[2]] }
 
-/// Returns true iff the quad strictly intersects the voxel interior (SAT test).
+// Returns true iff the quad strictly intersects the voxel interior (SAT test).
 pub fn quad_aabb_intersects(verts: &[[f32; 3]; 4], vox: [usize; 3]) -> bool {
   let min = [vox[0] as f32, vox[1] as f32, vox[2] as f32];
   let max = [min[0]+1.0, min[1]+1.0, min[2]+1.0];
@@ -74,9 +72,7 @@ pub fn quad_aabb_intersects(verts: &[[f32; 3]; 4], vox: [usize; 3]) -> bool {
   true
 }
 
-// ── Color sampling ────────────────────────────────────────────────────────────
-
-/// Project the voxel center onto the quad's element plane and sample the texture.
+// Project the voxel center onto the quad's element plane and sample the texture.
 fn sample_quad_at_voxel(quad: &Quad, vox: [usize; 3], textures: &HashMap<String, RgbaImage>) -> Option<[u8; 4]> {
   let center = [vox[0] as f32 + 0.5, vox[1] as f32 + 0.5, vox[2] as f32 + 0.5];
   // Undo blockstate rotation: inverse Y-then-X = undo-X-then-undo-Y.
@@ -114,8 +110,6 @@ fn sample_quad_at_voxel(quad: &Quad, vox: [usize; 3], textures: &HashMap<String,
   Some(rgba)
 }
 
-// ── Bounding box ──────────────────────────────────────────────────────────────
-
 fn quad_voxel_bbox(verts: &[[f32; 3]; 4]) -> ([usize; 3], [usize; 3]) {
   let mut mn = [f32::INFINITY; 3];
   let mut mx = [f32::NEG_INFINITY; 3];
@@ -127,17 +121,15 @@ fn quad_voxel_bbox(verts: &[[f32; 3]; 4]) -> ([usize; 3], [usize; 3]) {
   (lo, hi)
 }
 
-// ── VoxelGrid ─────────────────────────────────────────────────────────────────
-
 pub struct VoxelGrid {
-  /// 4096-bit geometry bitmask. Bit index = x + y*16 + z*256.
+  // 4096-bit geometry bitmask. Bit index = x + y*16 + z*256.
   pub bitmask: [u32; 128],
-  /// 64-bit coarse bitmask. One bit per 4×4×4 region.
+  // 64-bit coarse bitmask. One bit per 4×4×4 region.
   pub coarse: u64,
-  /// Palette-indexed color per solid voxel, in x+y*16+z*256 popcount order.
+  // Palette-indexed color per solid voxel, in x+y*16+z*256 popcount order.
   pub color_indices: Vec<u8>,
   pub palette: Palette,
-  /// True if this block emits light (stored as bit 0 of the flags byte in materials.bin).
+  // True if this block emits light (stored as bit 0 of the flags byte in materials.bin).
   pub is_emissive: bool,
 }
 
@@ -147,13 +139,11 @@ impl Default for VoxelGrid {
   }
 }
 
-// ── Main voxelization ─────────────────────────────────────────────────────────
-
-/// Voxelize a list of quads into a VoxelGrid.
-///
-/// Maintains separate accumulators for tinted and untinted quads. When both
-/// contribute to a voxel (e.g. grass_block side: dirt base + tinted overlay),
-/// the tinted color is alpha-composited over the base rather than averaged.
+// Voxelize a list of quads into a VoxelGrid.
+//
+// Maintains separate accumulators for tinted and untinted quads. When both
+// contribute to a voxel (e.g. grass_block side: dirt base + tinted overlay),
+// the tinted color is alpha-composited over the base rather than averaged.
 pub fn voxelize(quads: &[Quad], textures: &HashMap<String, RgbaImage>) -> VoxelGrid {
   let mut base_acc = [[0u32; 5]; 4096]; // untinted: [r, g, b, a, count]
   let mut tint_acc = [[0u32; 5]; 4096]; // tinted:   [r, g, b, a, count]
@@ -216,14 +206,12 @@ pub fn voxelize(quads: &[Quad], textures: &HashMap<String, RgbaImage>) -> VoxelG
   VoxelGrid { bitmask, coarse, color_indices, palette, is_emissive: false }
 }
 
-// ── Fluid voxelization ────────────────────────────────────────────────────────
-
-/// Voxelize a fluid (water or lava) block from its `level` property.
-///
-/// Level 0 (source) and 8+ (falling) fill the full 16-voxel height.
-/// Levels 1–7 fill `(8 - level) * 2` voxels from the bottom.
-/// Top surface uses the still texture (XZ plane); sides use the flow texture.
-/// Water colors are tinted to plains biome water color.
+// Voxelize a fluid (water or lava) block from its `level` property.
+//
+// Level 0 (source) and 8+ (falling) fill the full 16-voxel height.
+// Levels 1–7 fill `(8 - level) * 2` voxels from the bottom.
+// Top surface uses the still texture (XZ plane); sides use the flow texture.
+// Water colors are tinted to plains biome water color.
 pub fn voxelize_fluid(is_lava: bool, level: u32, still: &RgbaImage, flow: &RgbaImage) -> VoxelGrid {
   let height = if level == 0 || level >= 8 { 16usize } else { (8 - level) as usize * 2 };
 
@@ -258,9 +246,9 @@ pub fn voxelize_fluid(is_lava: bool, level: u32, still: &RgbaImage, flow: &RgbaI
   VoxelGrid { bitmask, coarse, color_indices, palette, is_emissive: is_lava }
 }
 
-/// Fill every empty voxel in `grid` with water. Used for waterlogged blocks.
-/// Side voxels (outer ring) use the flow texture; all others use the still texture.
-/// Colors are tinted to plains biome water color.
+// Fill every empty voxel in `grid` with water. Used for waterlogged blocks.
+// Side voxels (outer ring) use the flow texture; all others use the still texture.
+// Colors are tinted to plains biome water color.
 pub fn apply_waterlogging(grid: &mut VoxelGrid, still: &RgbaImage, flow: &RgbaImage) {
   let mut new_indices = Vec::with_capacity(4096);
   let mut old_iter = grid.color_indices.iter();
@@ -292,10 +280,8 @@ pub fn apply_waterlogging(grid: &mut VoxelGrid, still: &RgbaImage, flow: &RgbaIm
   grid.coarse = compute_coarse(&grid.bitmask);
 }
 
-// ── Coarse bitmask ────────────────────────────────────────────────────────────
-
-/// Build the 64-bit coarse bitmask from a fine-grained 4096-bit bitmask.
-/// One bit per 4×4×4 sub-region; set if any voxel in that region is solid.
+// Build the 64-bit coarse bitmask from a fine-grained 4096-bit bitmask.
+// One bit per 4×4×4 sub-region; set if any voxel in that region is solid.
 pub fn compute_coarse(bitmask: &[u32; 128]) -> u64 {
   let mut coarse = 0u64;
   for cz in 0..4usize {

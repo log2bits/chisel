@@ -1,7 +1,7 @@
-/// Read-only accessor for the Minecraft client JAR (a ZIP file).
-///
-/// Caches decompressed file bytes in a HashMap so repeated lookups of the same
-/// asset (e.g. the same texture referenced by several block models) are free.
+// Read-only accessor for the Minecraft client JAR (a ZIP file).
+//
+// Caches decompressed file bytes in a HashMap so repeated lookups of the same
+// asset (e.g. the same texture referenced by several block models) are free.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,10 +25,10 @@ impl Jar {
     Ok(Self { archive, cache: HashMap::new() })
   }
 
-  /// Return the raw bytes of the given JAR-internal path (e.g.
-  /// `"assets/minecraft/models/block/stone.json"`).
-  ///
-  /// Returns `None` if the entry doesn't exist.
+  // Return the raw bytes of the given JAR-internal path (e.g.
+  // `"assets/minecraft/models/block/stone.json"`).
+  //
+  // Returns `None` if the entry doesn't exist.
   pub fn get(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
     if let Some(bytes) = self.cache.get(path) {
       return Ok(Some(bytes.clone()));
@@ -47,7 +47,7 @@ impl Jar {
     }
   }
 
-  /// Like `get` but returns an error if the entry is missing.
+  // Like `get` but returns an error if the entry is missing.
   pub fn get_required(&mut self, path: &str) -> Result<Vec<u8>> {
     self.get(path)?.with_context(|| format!("JAR entry not found: {path}"))
   }

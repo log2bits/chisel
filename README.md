@@ -126,7 +126,7 @@ File size: ~2.4 MB.
 
 Maps every u16 BlockStateId to a deduplicated voxel geometry shape. The geometry section is the hot path during ray traversal and is sized to fit in GPU L2 cache.
 
-Bitmask shapes are deduplicated across all block states: 29,671 block states collapse to ~407 unique shapes. Many blocks share the same 16x16x16 geometry (e.g. all fully-solid blocks share one all-ones bitmask).
+Bitmask shapes are deduplicated across all block states: 29,671 block states collapse to ~1,553 unique shapes. Many blocks share the same 16x16x16 geometry (e.g. all fully-solid blocks share one all-ones bitmask).
 
 Format:
 ```
@@ -154,15 +154,15 @@ word:  bitmask[flat_idx / 32]
 bit:   (word >> (flat_idx % 32)) & 1
 ```
 
-Total size: ~261 KB.
+Total size: ~847 KB.
 
 ### materials.bin
 
-Maps every u16 BlockStateId to palette-compressed color data for its solid voxels. This is the cold path — accessed only when a ray hits a block. Geometry (bitmask/coarse) is in geometry.bin.
+Maps every u16 BlockStateId to palette-compressed color data for its solid voxels. This is the cold path - accessed only when a ray hits a block. Geometry (bitmask/coarse) is in geometry.bin.
 
 The IDs in `block_states.bin`, `geometry.bin`, and `materials.bin` are derived from the same `blocks.json` and always match as long as all three are generated together by `chisel-bake`.
 
-Color payloads are deduplicated across all block states: 26,756 non-empty block states collapse to ~4,332 unique color payloads. Many block states share identical visual data despite having different behavioral properties (e.g. all redstone power levels, all note block instrument/note combinations, all waterlogged variants of the same block type). This mirrors the bitmask deduplication in geometry.bin.
+Color payloads are deduplicated across all block states: 26,606 non-empty block states collapse to 16,904 unique color payloads. Many block states share identical visual data despite having different behavioral properties (e.g. all redstone power levels, all note block instrument/note combinations, all waterlogged variants of the same block type). This mirrors the bitmask deduplication in geometry.bin.
 
 Color_id 0 is a sentinel meaning "no color data" (empty/air block). Valid color_ids are 1..=num_payloads.
 
@@ -183,7 +183,7 @@ Format:
 GPU lookup:
 ```
 color_id      = color_ids[block_state_id]         // ~58 KB, fits in L1
-payload_off   = payload_offsets[color_id - 1]     // ~17 KB for ~4K payloads
+payload_off   = payload_offsets[color_id - 1]     // ~66 KB for ~17K payloads
 payload       = payload_data[payload_off..]        // palette + indices
 ```
 
@@ -191,12 +191,12 @@ Color indices are stored only for solid voxels. The index into the color array f
 
 Measured from Minecraft 1.21.11:
 ```
-26,756 non-empty block states
- 4,332 unique color payloads (after deduplication)
-17,705 unique RGBA colors across all voxelized blocks
-Total payload data:    ~3.97 MB
-Total materials.bin:   ~4.02 MB (was ~20.2 MB without deduplication)
-Savings:               ~16.2 MB (80% reduction)
+26,606 non-empty block states
+16,904 unique color payloads (after deduplication)
+19,900 unique RGBA colors across all voxelized blocks
+Total payload data:    ~39.1 MB
+Total materials.bin:   ~39.3 MB (was ~55.2 MB without deduplication)
+Savings:               ~15.9 MB (29% reduction)
 ```
 
 ---
@@ -285,19 +285,19 @@ The Carver uses a quad-intersection approach.
 
 **1. Build the color palette.** Read all the textures the block needs and collect every unique RGBA color across all of them. This becomes the block's palette. The max number of unique colors across all textures on a single block in Minecraft 1.21.11 is 219, so an 8-bit palette index always works.
 
-**2. Resolve the model.** Parse the blockstate JSON to find which model file applies. Follow the parent chain (most models inherit from a parent like `block/cube_all`) until you have a complete set of elements with all texture variables resolved. Texture variables like `#side` get substituted through the model's `textures` map.
+**2. Resolve the model.** Parse the blockstate JSON to find which model(s) apply. For variant blocks a single model is selected by matching the block's property key. For multipart blocks (fences, walls, chorus plants, etc.) all entries whose `when` condition matches the block's properties are collected - including OR conditions and pipe-separated values - and their quads are merged before voxelization. Follow each model's parent chain (most models inherit from a parent like `block/cube_all`) until you have a complete set of elements with all texture variables resolved. Texture variables like `#side` get substituted through the model's `textures` map.
 
-**3. Decompose into quads.** Each element in the model JSON is a rectangular prism with a `from` and `to` in 0–16 unit space. Generate up to 6 quads per prism (one per face). For volumetric faces, shift each quad 0.5 units inward toward the prism center and trim 0.5 units from all four edges in the face plane, so the quad strictly intersects the shell voxels' interiors rather than touching boundaries. Zero-thickness quads (like the grass cross-plane) skip the shift and trim. Flat ground quads sitting exactly on an integer voxel boundary (like rails at y=1) are nudged 0.5 units into the nearest voxel so the intersection test can find them.
+**3. Decompose into quads.** Each element in the model JSON is a rectangular prism with a `from` and `to` in 0–16 unit space. Generate up to 6 quads per prism (one per face). For volumetric faces, shift each quad 0.5 units inward toward the prism center and trim 0.5 units from all four edges in the face plane, so the quad strictly intersects the shell voxels' interiors rather than touching boundaries. Zero-thickness quads (like the grass cross-plane or iron chain) skip the shift and trim. Zero-thickness quads that sit exactly on an integer voxel boundary are nudged 0.5 units into an adjacent voxel so the SAT intersection test can find them - nudged away from the block center (outward) by default, or inward if the quad is at the block border (position 0 or 16).
 
-**4. Intersect quad-major.** For each quad, compute its voxel bounding box and test only the voxels within it using a full SAT (Separating Axis Theorem) intersection test. Strict intersection only — a quad touching a voxel face or edge without entering its interior doesn't count. This visits far fewer voxels than looping all 4096 for every quad.
+**4. Intersect quad-major.** For each quad, compute its voxel bounding box and test only the voxels within it using a full SAT (Separating Axis Theorem) intersection test. Strict intersection only - a quad touching a voxel face or edge without entering its interior doesn't count. This visits far fewer voxels than looping all 4096 for every quad.
 
-**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad's element plane (applying any element rotation in reverse), use the model's UV coordinates to look up the nearest texture pixel, and average all sampled RGBA values if multiple quads hit the same voxel. Transparent pixels (alpha = 0) are skipped entirely.
+**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad's element plane (undoing element rotation, then blockstate rotation) and check that the projected point falls within the element's bounds in the face plane - this rejects edge voxels whose bounding boxes clip the quad but whose centers lie outside it (common with rotated thin quads like chain links). Then use the model's UV coordinates to look up the nearest texture pixel and average all sampled RGBA values if multiple quads hit the same voxel. Transparent pixels (alpha = 0) are skipped entirely.
 
 **6. Snap to palette.** Find the nearest palette color to the averaged RGBA result. That index becomes the voxel's material value.
 
 Interior voxels that no quad passes through stay empty. A full solid cube ends up with roughly 1,352 solid voxels out of 4,096, which falls out of the algorithm for free.
 
-**Fluids (water and lava).** These blocks have no usable model in the client JAR — they're rendered procedurally at runtime. The Carver handles them as solid rectangular prisms. The height is derived from the `level` property: level 0 (source) and levels 8+ (falling) are full height (16 voxels); flowing levels 1–7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the `water_still` / `lava_still` texture per-voxel at (x, z). Side voxels on the outer ring sample the `water_flow` / `lava_flow` texture. Water colors are tinted to the plains biome water color (`#3F76E4`). Lava is marked emissive.
+**Fluids (water and lava).** These blocks have no usable model in the client JAR - they're rendered procedurally at runtime. The Carver handles them as solid rectangular prisms. The height is derived from the `level` property: level 0 (source) and levels 8+ (falling) are full height (16 voxels); flowing levels 1–7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the `water_still` / `lava_still` texture per-voxel at (x, z). Side voxels on the outer ring sample the `water_flow` / `lava_flow` texture. Water colors are tinted to the plains biome water color (`#3F76E4`). Lava is marked emissive.
 
 **Waterlogged blocks.** Any block state with `waterlogged=true` gets a two-pass treatment: first the block is voxelized normally via the model pipeline, then every voxel that the geometry left empty is filled with the `water_still` texture color, tinted to plains biome water color. This correctly fills the hollow space in waterlogged slabs, stairs, fences, etc.
 

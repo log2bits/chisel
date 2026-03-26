@@ -1,21 +1,21 @@
-//! The Carver: reads all Minecraft block models + textures from the client JAR,
-//! voxelizes every block state into a 16×16×16 brick, writes geometry.bin + materials.bin.
-//!
-//! geometry.bin — hot path (stays in GPU L2 cache):
-//!   [4]               "GEOM"
-//!   [4]               count (u32)
-//!   [4]               num_shapes (u32)
-//!   [count × 2]       bitmask_id per block state (u16)
-//!   [num_shapes × 520] shape table: coarse(u64) + bitmask([u32;128])
-//!
-//! materials.bin — cold path (accessed once per ray hit):
-//!   [4]                  "MATL"
-//!   [4]                  count (u32)
-//!   [4]                  num_payloads (u32)
-//!   [count × 2]          color_id per block state (u16, 0 = no color)
-//!   [num_payloads × 4]   payload byte offsets (u32, from start of payload data)
-//!   [variable]           payload data: meta(4) + palette(N×4) + indices(M) per payload
-//!                        meta flags (bits 7-0): bit 0 = is_emissive
+// The Carver: reads all Minecraft block models + textures from the client JAR,
+// voxelizes every block state into a 16×16×16 brick, writes geometry.bin + materials.bin.
+//
+// geometry.bin - hot path (stays in GPU L2 cache):
+//   [4]               "GEOM"
+//   [4]               count (u32)
+//   [4]               num_shapes (u32)
+//   [count × 2]       bitmask_id per block state (u16)
+//   [num_shapes × 520] shape table: coarse(u64) + bitmask([u32;128])
+//
+// materials.bin - cold path (accessed once per ray hit):
+//   [4]                  "MATL"
+//   [4]                  count (u32)
+//   [4]                  num_payloads (u32)
+//   [count × 2]          color_id per block state (u16, 0 = no color)
+//   [num_payloads × 4]   payload byte offsets (u32, from start of payload data)
+//   [variable]           payload data: meta(4) + palette(N×4) + indices(M) per payload
+//                        meta flags (bits 7-0): bit 0 = is_emissive
 
 pub mod blockstate;
 pub mod jar;
@@ -38,16 +38,12 @@ use model::build_quads;
 use texture::{load_texture, RgbaImage};
 use voxelizer::{voxelize, VoxelGrid, voxelize_fluid, apply_waterlogging};
 
-// ── Thread-local state ────────────────────────────────────────────────────────
 // Each rayon worker opens the JAR once and keeps its own texture cache,
 // eliminating all locking overhead during parallel voxelization.
-
 thread_local! {
   static THREAD_JAR: RefCell<Option<Jar>> = RefCell::new(None);
   static THREAD_TEX: RefCell<HashMap<String, RgbaImage>> = RefCell::new(HashMap::new());
 }
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn generate_materials(client_jar: &Path, output_dir: &Path) -> Result<()> {
   let mut entries = blockstate::load_entries(Path::new("data/block_states.bin"))?;
@@ -92,10 +88,8 @@ pub fn generate_materials(client_jar: &Path, output_dir: &Path) -> Result<()> {
   Ok(())
 }
 
-// ── Biome tint colors (plains) ────────────────────────────────────────────────
-
-/// Returns the plains-biome tint color for a block name.
-/// Used for any face with `tintindex` in the model JSON.
+// Returns the plains-biome tint color for a block name.
+// Used for any face with `tintindex` in the model JSON.
 fn plains_tint(name: &str) -> [u8; 3] {
   match name {
     "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves"
@@ -104,8 +98,6 @@ fn plains_tint(name: &str) -> [u8; 3] {
     _ => [0x91, 0xBD, 0x59], // grass colormap at plains
   }
 }
-
-// ── Emissive blocks ───────────────────────────────────────────────────────────
 
 fn is_emissive(name: &str, props: &HashMap<&str, &str>) -> bool {
   match name {
@@ -135,9 +127,7 @@ fn is_emissive(name: &str, props: &HashMap<&str, &str>) -> bool {
   }
 }
 
-// ── Per-block-state voxelization ──────────────────────────────────────────────
-
-/// Load a texture into the cache if not already present.
+// Load a texture into the cache if not already present.
 fn ensure_texture<'a>(name: &str, jar: &mut Jar, cache: &'a mut HashMap<String, RgbaImage>) -> Option<&'a RgbaImage> {
   if !cache.contains_key(name) {
     if let Ok(img) = load_texture(name, jar) { cache.insert(name.to_owned(), img); }
@@ -152,7 +142,7 @@ fn voxelize_block_state(key: &str, jar: &mut Jar, tex_cache: &mut HashMap<String
 
   let (name, props) = blockstate::parse_key(key);
 
-  // Fluids are procedural — no usable model in the JAR.
+  // Fluids are procedural - no usable model in the JAR.
   if matches!(name, "water" | "lava") {
     let level: u32 = props.get("level").and_then(|v| v.parse().ok()).unwrap_or(0);
     let is_lava   = name == "lava";
