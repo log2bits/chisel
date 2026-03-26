@@ -11,8 +11,8 @@ use super::voxelizer::VoxelGrid;
 
 // Write geometry.bin: deduplicated voxel bitmask shapes for all block states.
 //
-// Layout: "GEOM" + count(u32) + num_shapes(u32) + bitmask_ids(count×u16)
-//         + shape_table(num_shapes × 520 bytes: coarse(u64) + bitmask([u32;128]))
+// Layout: "GEOM" + count(u32) + num_shapes(u32) + bitmask_ids(count*u16)
+//         + shape_table(num_shapes*520 bytes: coarse(u64) + bitmask([u32;128]))
 pub fn write_geometry(results: &[(u16, VoxelGrid)], count: usize, path: &Path) -> Result<()> {
   let mut shape_map: HashMap<[u32; 128], u16> = HashMap::new();
   let mut shapes: Vec<(u64, [u32; 128])> = Vec::new();
@@ -50,8 +50,8 @@ pub fn write_geometry(results: &[(u16, VoxelGrid)], count: usize, path: &Path) -
 // Write materials.bin: deduplicated color payloads for all block states.
 //
 // Layout: "MATL" + count(u32) + num_payloads(u32)
-//         + color_ids(count×u16) + payload_offsets(num_payloads×u32)
-//         + payload data (meta(4) + palette(N×4) + indices(M) per payload)
+//         + color_ids(count*u16) + payload_offsets(num_payloads*u32)
+//         + payload data (meta(4) + palette(N*4) + indices(M) per payload)
 pub fn write_materials(results: &[(u16, VoxelGrid)], count: usize, path: &Path) -> Result<()> {
   let mut payload_map: HashMap<Vec<u8>, u16> = HashMap::new();
   let mut payloads: Vec<Vec<u8>> = Vec::new();
@@ -90,7 +90,7 @@ pub fn write_materials(results: &[(u16, VoxelGrid)], count: usize, path: &Path) 
 
 // Serialize a VoxelGrid's color data into a payload byte vector.
 //
-// Format: meta(4) + palette(N×4) + indices(M)
+// Format: meta(4) + palette(N*4) + indices(M)
 // Meta word: palette_count(8b) | solid_count(16b) | flags(8b)
 // flags bit 0: is_emissive
 fn serialize_payload(grid: &VoxelGrid) -> Vec<u8> {

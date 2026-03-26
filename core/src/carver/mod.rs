@@ -1,20 +1,20 @@
 // The Carver: reads all Minecraft block models + textures from the client JAR,
-// voxelizes every block state into a 16×16×16 brick, writes geometry.bin + materials.bin.
+// voxelizes every block state into a 16x16x16 brick, writes geometry.bin + materials.bin.
 //
 // geometry.bin - hot path (stays in GPU L2 cache):
 //   [4]               "GEOM"
 //   [4]               count (u32)
 //   [4]               num_shapes (u32)
-//   [count × 2]       bitmask_id per block state (u16)
-//   [num_shapes × 520] shape table: coarse(u64) + bitmask([u32;128])
+//   [count*2]         bitmask_id per block state (u16)
+//   [num_shapes*520]  shape table: coarse(u64) + bitmask([u32;128])
 //
 // materials.bin - cold path (accessed once per ray hit):
 //   [4]                  "MATL"
 //   [4]                  count (u32)
 //   [4]                  num_payloads (u32)
-//   [count × 2]          color_id per block state (u16, 0 = no color)
-//   [num_payloads × 4]   payload byte offsets (u32, from start of payload data)
-//   [variable]           payload data: meta(4) + palette(N×4) + indices(M) per payload
+//   [count*2]            color_id per block state (u16, 0 = no color)
+//   [num_payloads*4]     payload byte offsets (u32, from start of payload data)
+//   [variable]           payload data: meta(4) + palette(N*4) + indices(M) per payload
 //                        meta flags (bits 7-0): bit 0 = is_emissive
 
 pub mod blockstate;

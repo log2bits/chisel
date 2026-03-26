@@ -142,51 +142,40 @@ fn decode_legacy_palette(raw_chunk: &RawChunk, table: &BlockStateTable) -> Resul
 }
 
 fn decode_modern(raw_chunk: &RawChunk, table: &BlockStateTable) -> Result<Chunk> {
-    let mut chunk = Chunk {
-      sections: Vec::new(),
-    };
-    for raw_section in &raw_chunk.sections {
-      match &raw_section.block_states {
-        None => {
-          chunk.sections.push(Section {
-            y: raw_section.y,
-            blocks: [0u16; 4096],
-          });
-        }
-        Some(states) if states.data.is_none() => {
-          let id = table.get(&states.palette[0].name, &states.palette[0].properties).unwrap_or(0);
-          chunk.sections.push(Section {
-            y: raw_section.y,
-            blocks: [id; 4096],
-          });
-        }
-        Some(states) => {
-          let palette: Vec<u16> = states.palette.iter().map(|entry| {
-            table.get(&entry.name, &entry.properties).unwrap_or(0)
-          }).collect();
+  let mut chunk = Chunk { sections: Vec::new() };
+  for raw_section in &raw_chunk.sections {
+    match &raw_section.block_states {
+      None => {
+        chunk.sections.push(Section { y: raw_section.y, blocks: [0u16; 4096] });
+      }
+      Some(states) if states.data.is_none() => {
+        let id = table.get(&states.palette[0].name, &states.palette[0].properties).unwrap_or(0);
+        chunk.sections.push(Section { y: raw_section.y, blocks: [id; 4096] });
+      }
+      Some(states) => {
+        let palette: Vec<u16> = states.palette.iter().map(|entry| {
+          table.get(&entry.name, &entry.properties).unwrap_or(0)
+        }).collect();
 
-          let bits_per_entry = (usize::BITS - (states.palette.len() - 1).leading_zeros()).max(4) as usize;
-          let entries_per_long = 64 / bits_per_entry;
-          let mask = (1u64 << bits_per_entry) - 1;
-          let mut blocks = [0u16; 4096];
-          let data = states.data.as_ref().unwrap();
+        let bits_per_entry = (usize::BITS - (states.palette.len() - 1).leading_zeros()).max(4) as usize;
+        let entries_per_long = 64 / bits_per_entry;
+        let mask = (1u64 << bits_per_entry) - 1;
+        let mut blocks = [0u16; 4096];
+        let data = states.data.as_ref().unwrap();
 
-          for (long_index, &long) in data.iter().enumerate() {
-            for i in 0..entries_per_long {
-              let palette_index = (long as u64 >> (i * bits_per_entry) as u64) & mask;
-              let block_index = long_index * entries_per_long + i;
-              if block_index < 4096 {
-                blocks[block_index] = palette[palette_index as usize];
-              }
+        for (long_index, &long) in data.iter().enumerate() {
+          for i in 0..entries_per_long {
+            let palette_index = (long as u64 >> (i * bits_per_entry) as u64) & mask;
+            let block_index = long_index * entries_per_long + i;
+            if block_index < 4096 {
+              blocks[block_index] = palette[palette_index as usize];
             }
           }
-
-          chunk.sections.push(Section {
-            y: raw_section.y,
-            blocks,
-          });
         }
+
+        chunk.sections.push(Section { y: raw_section.y, blocks });
       }
     }
-    Ok(chunk)
+  }
+  Ok(chunk)
 }

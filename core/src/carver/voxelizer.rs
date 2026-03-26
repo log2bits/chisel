@@ -1,7 +1,7 @@
 // Voxelizer: for each quad, iterate only over voxels in its bounding box,
 // run a SAT intersection test, and accumulate texture colors.
 //
-// Voxel (x, y, z) occupies AABB [x, x+1] × [y, y+1] × [z, z+1].
+// Voxel (x, y, z) occupies AABB [x,x+1]*[y,y+1]*[z,z+1].
 // Two accumulators are kept per voxel (tinted and untinted) so that overlay
 // textures like grass_block's side grass are alpha-composited over the base
 // rather than averaged with it.
@@ -59,7 +59,7 @@ pub fn quad_aabb_intersects(verts: &[[f32; 3]; 4], vox: [usize; 3]) -> bool {
     if !sat_overlap(&project_quad(verts, n), &project_aabb(min, max, n)) { return false; }
   }
 
-  // 3. Edge × world-axis cross products (12 axes)
+  // 3. Edge x world-axis cross products (12 axes)
   let edges = [sub(verts[1],verts[0]), sub(verts[2],verts[1]), sub(verts[3],verts[2]), sub(verts[0],verts[3])];
   for edge in &edges {
     for world in [[1.0f32,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]] {
@@ -124,7 +124,7 @@ fn quad_voxel_bbox(verts: &[[f32; 3]; 4]) -> ([usize; 3], [usize; 3]) {
 pub struct VoxelGrid {
   // 4096-bit geometry bitmask. Bit index = x + y*16 + z*256.
   pub bitmask: [u32; 128],
-  // 64-bit coarse bitmask. One bit per 4×4×4 region.
+  // 64-bit coarse bitmask. One bit per 4x4x4 region.
   pub coarse: u64,
   // Palette-indexed color per solid voxel, in x+y*16+z*256 popcount order.
   pub color_indices: Vec<u8>,
@@ -281,7 +281,7 @@ pub fn apply_waterlogging(grid: &mut VoxelGrid, still: &RgbaImage, flow: &RgbaIm
 }
 
 // Build the 64-bit coarse bitmask from a fine-grained 4096-bit bitmask.
-// One bit per 4×4×4 sub-region; set if any voxel in that region is solid.
+// One bit per 4x4x4 sub-region; set if any voxel in that region is solid.
 pub fn compute_coarse(bitmask: &[u32; 128]) -> u64 {
   let mut coarse = 0u64;
   for cz in 0..4usize {

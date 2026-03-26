@@ -25,10 +25,7 @@ impl Jar {
     Ok(Self { archive, cache: HashMap::new() })
   }
 
-  // Return the raw bytes of the given JAR-internal path (e.g.
-  // `"assets/minecraft/models/block/stone.json"`).
-  //
-  // Returns `None` if the entry doesn't exist.
+  // Returns the decompressed bytes for a JAR-internal path, or None if not found.
   pub fn get(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
     if let Some(bytes) = self.cache.get(path) {
       return Ok(Some(bytes.clone()));
@@ -47,7 +44,7 @@ impl Jar {
     }
   }
 
-  // Like `get` but returns an error if the entry is missing.
+  // Like get, but errors instead of returning None if the entry's missing.
   pub fn get_required(&mut self, path: &str) -> Result<Vec<u8>> {
     self.get(path)?.with_context(|| format!("JAR entry not found: {path}"))
   }

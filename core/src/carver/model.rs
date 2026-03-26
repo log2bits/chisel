@@ -169,8 +169,8 @@ pub fn unrotate_point(p: [f32; 3], origin: [f32; 3], axis: &str, angle_deg: f32,
   if !rescale {
     return rotate_point(p, origin, axis, -angle_deg, false);
   }
-  // Forward: world = origin + R(angle) × (local − origin) / |cos(angle)|
-  // Inverse: local = origin + |cos(angle)| × R(−angle) × (world − origin)
+  // Forward: world = origin + R(angle) * (local - origin) / |cos(angle)|
+  // Inverse: local = origin + |cos(angle)| * R(-angle) * (world - origin)
   let cos = angle_deg.to_radians().abs().cos().max(1e-4);
   let r = rotate_point(p, origin, axis, -angle_deg, false);
   let [ox, oy, oz] = origin;

@@ -82,9 +82,6 @@ fn main() -> Result<()> {
   println!("\nall data files generated successfully.");
   Ok(())
 }
-// --export-vox
-// Reads from data/block_states.bin, data/geometry.bin, data/materials.bin
-// to test the full end-to-end pipeline without re-voxelizing.
 
 // Normalize a block state key so properties are sorted alphabetically,
 // matching the format stored in block_states.bin.
@@ -169,9 +166,8 @@ fn export_vox(block_state_key: &str, out_path: &str) -> Result<()> {
   println!("wrote {out_path}");
   Ok(())
 }
-// MagicaVoxel .vox writer
-// Coordinate remap: MC(x,y,z) -> Vox(x, z, y)  (Y-up -> Z-up)
 
+// MagicaVoxel .vox writer. Coordinate remap: MC(x,y,z) -> Vox(x,z,y) (Y-up to Z-up).
 fn write_vox(grid: &VoxelGrid) -> Vec<u8> {
   let mut voxels: Vec<(u8,u8,u8,u8)> = Vec::new();
   let mut color_iter = grid.color_indices.iter();
