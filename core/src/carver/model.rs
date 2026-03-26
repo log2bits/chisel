@@ -80,7 +80,9 @@ pub struct Quad {
   pub elem_from: [f32; 3],
   pub elem_to: [f32; 3],
   pub elem_rot: Option<ElemRotation>,
-  pub tint: i32,
+  /// Biome tint color to multiply into this quad's texture, or None for no tint.
+  /// Only set when the face has a tintindex in the model JSON.
+  pub tint_color: Option<[u8; 3]>,
   /// Blockstate variant rotation (degrees, multiples of 90).
   /// Applied Y-axis first, then X-axis, around block center (8,8,8).
   pub bs_x_rot: u32,
@@ -233,7 +235,9 @@ fn shift_face_inward(vertices: &mut [[f32; 3]; 4], dir: FaceDir, from: [f32; 3],
 
 // Public entry point
 
-pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32) -> Result<Vec<Quad>> {
+/// Build all quads for a block model. `tint_color` is applied to any quad
+/// that has a `tintindex` in the model JSON (biome-dependent coloring).
+pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32, tint_color: [u8; 3]) -> Result<Vec<Quad>> {
   let (textures, elements) = resolve_model(model_name, jar)?;
   let mut quads = Vec::new();
 
@@ -274,8 +278,12 @@ pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32
       // Zero-thickness quads at integer voxel boundaries fail the strict SAT test:
       // a plane at y=0 projects to [0,0] on Y; voxel 0 projects to [0,1]; 0<0 is false.
       // After rotation, if all vertices still share the same face-axis coordinate at an
-      // integer position, nudge 0.5 into the nearest voxel so the SAT test can find it.
+      // integer position, nudge 0.5 into a voxel so the SAT test can find it.
       // Cross model quads (rotated 45°) have varying face-axis coords → no nudge.
+      //
+      // Direction: nudge away from the block center (8) so the quad ends up on the
+      // "outside" face of the nearest voxel. Exception: quads at the block border
+      // (pos=0 or pos=16) nudge inward instead so they stay inside the brick.
       let face_axis = match dir {
         FaceDir::North | FaceDir::South => 2,
         FaceDir::East  | FaceDir::West  => 0,
@@ -291,8 +299,15 @@ pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32
         if verts.iter().all(|v| (v[face_axis] - pos).abs() < 0.001)
            && (pos - pos.round()).abs() < 0.001
         {
-          let voxel = ((pos - 0.5).floor() as i32).clamp(0, 15);
-          let nudge = (voxel as f32 + 0.5) - pos;
+          let nudge = if pos < 0.001 {
+            0.5   // block border at 0: shift inward
+          } else if pos > 15.999 {
+            -0.5  // block border at 16: shift inward
+          } else if pos <= 8.0 {
+            -0.5  // below/at center: shift outward (toward 0)
+          } else {
+            0.5   // above center: shift outward (toward 16)
+          };
           for v in verts.iter_mut() { v[face_axis] += nudge; }
         }
       }
@@ -315,7 +330,7 @@ pub fn build_quads(model_name: &str, jar: &mut Jar, bs_x_rot: u32, bs_y_rot: u32
         elem_from: from,
         elem_to: to,
         elem_rot: elem_rot.clone(),
-        tint: raw_face.tintindex.unwrap_or(-1),
+        tint_color: raw_face.tintindex.map(|_| tint_color),
         bs_x_rot,
         bs_y_rot,
       });

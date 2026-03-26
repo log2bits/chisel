@@ -174,7 +174,8 @@ Format:
 [count * 2 bytes]      color_id per block state (u16, 0 = no color data)
 [num_payloads * 4 bytes] payload byte offsets (u32, from start of payload data section)
 [variable]             payload data, one entry per unique payload:
-  [4 bytes]              meta: palette_count (8 bits) | solid_voxel_count (16 bits) | reserved (8 bits)
+  [4 bytes]              meta: palette_count (8 bits) | solid_voxel_count (16 bits) | flags (8 bits)
+                           flags bit 0: is_emissive (block emits light)
   [N * 4 bytes]          palette: RGBA8 entries, N = unique colors (1–256)
   [M bytes]              indices: 8-bit palette index per solid voxel, in popcount order
 ```
@@ -295,6 +296,14 @@ The Carver uses a quad-intersection approach.
 **6. Snap to palette.** Find the nearest palette color to the averaged RGBA result. That index becomes the voxel's material value.
 
 Interior voxels that no quad passes through stay empty. A full solid cube ends up with roughly 1,352 solid voxels out of 4,096, which falls out of the algorithm for free.
+
+**Fluids (water and lava).** These blocks have no usable model in the client JAR — they're rendered procedurally at runtime. The Carver handles them as solid rectangular prisms. The height is derived from the `level` property: level 0 (source) and levels 8+ (falling) are full height (16 voxels); flowing levels 1–7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the `water_still` / `lava_still` texture per-voxel at (x, z). Side voxels on the outer ring sample the `water_flow` / `lava_flow` texture. Water colors are tinted to the plains biome water color (`#3F76E4`). Lava is marked emissive.
+
+**Waterlogged blocks.** Any block state with `waterlogged=true` gets a two-pass treatment: first the block is voxelized normally via the model pipeline, then every voxel that the geometry left empty is filled with the `water_still` texture color, tinted to plains biome water color. This correctly fills the hollow space in waterlogged slabs, stairs, fences, etc.
+
+**Biome tinting.** All tintable faces (those with `tintindex` in the model JSON) use plains biome colors: grass colormap `#91BD59`, foliage colormap `#77AB2F`. Overlay textures (e.g. the grass-colored side overlay on `grass_block`) are alpha-composited over the base texture rather than averaged, so the grass pattern correctly overlays the dirt base.
+
+**Emissive flag.** One bit per brick in the materials.bin `flags` byte (`meta & 1`) marks whether the block emits light. The GPU is responsible for interpreting this however it sees fit (bloom, screen-space glow, full-bright shading, etc.). Emissive blocks include glowstone, sea lantern, fire, torches, lava, and similar light sources. Some blocks are conditionally emissive based on properties (e.g. furnaces are only emissive when `lit=true`).
 
 ---
 
@@ -493,7 +502,7 @@ Primary visibility plus hard shadow rays. Sun directional light with basic Lambe
 
 **Pre-1.13 world support.** The Reader currently handles 1.13+. Pre-flattening worlds (1.12 and earlier) need a static (block_id, metadata) -> modern block state string lookup table in `legacy.rs`.
 
-**Transparent block rendering.** Alpha is sampled from textures and averaged per voxel just like RGB. The ray caster currently treats all hits as opaque and needs to be updated to use the alpha channel.
+**Transparent block rendering.** Alpha is sampled from textures and averaged per voxel just like RGB (glass, stained glass, ice, and water have real sub-255 alpha values in the baked data). The ray caster currently treats all hits as opaque and needs to be updated to use the alpha channel.
 
 **Biome tinting.** Grass, leaves, and water change color per biome. The Carver currently bakes a single default color.
 

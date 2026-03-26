@@ -141,8 +141,8 @@ fn export_vox(block_state_key: &str, out_path: &str) -> Result<()> {
     mat[color_ids_base + block_id as usize * 2..][..2].try_into()?
   ) as usize;
 
-  let (palette, color_indices) = if color_id == 0 {
-    (Palette::default(), Vec::new())
+  let (palette, color_indices, is_emissive) = if color_id == 0 {
+    (Palette::default(), Vec::new(), false)
   } else {
     let payload_off = u32::from_le_bytes(
       mat[payload_offsets_base + (color_id - 1) * 4..][..4].try_into()?
@@ -152,6 +152,7 @@ fn export_vox(block_state_key: &str, out_path: &str) -> Result<()> {
     let meta          = u32::from_le_bytes(mat[p..][..4].try_into()?);
     let mut pal_count = ((meta >> 24) & 0xFF) as usize;
     let solid_count   = ((meta >> 8) & 0xFFFF) as usize;
+    let is_emissive   = (meta & 1) != 0;
     if solid_count > 0 && pal_count == 0 { pal_count = 256; }
 
     let mut palette = Palette::default();
@@ -161,11 +162,11 @@ fn export_vox(block_state_key: &str, out_path: &str) -> Result<()> {
       palette.get_or_insert([mat[o], mat[o+1], mat[o+2], mat[o+3]]);
     }
     let idx_base = pal_base + pal_count * 4;
-    (palette, mat[idx_base..idx_base + solid_count].to_vec())
+    (palette, mat[idx_base..idx_base + solid_count].to_vec(), is_emissive)
   };
-  println!("color_id={color_id}  palette={} colors  indices={}", palette.colors.len(), color_indices.len());
+  println!("color_id={color_id}  palette={} colors  indices={}  emissive={}", palette.colors.len(), color_indices.len(), is_emissive);
 
-  let grid = VoxelGrid { bitmask, coarse, color_indices, palette };
+  let grid = VoxelGrid { bitmask, coarse, color_indices, palette, is_emissive };
   let bytes = write_vox(&grid);
   fs::write(out_path, &bytes)?;
   println!("wrote {out_path}");

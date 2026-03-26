@@ -18,9 +18,8 @@ impl RgbaImage {
 }
 
 fn decode_png(bytes: &[u8]) -> Result<RgbaImage> {
-  let decoder = png::Decoder::new(bytes);
   // Expand palette, strip 16-bit to 8-bit, expand grayscale to RGB.
-  let mut decoder = decoder;
+  let mut decoder = png::Decoder::new(bytes);
   decoder.set_transformations(
     png::Transformations::EXPAND
     | png::Transformations::STRIP_16
@@ -87,12 +86,11 @@ pub fn sample_texture(img: &RgbaImage, u: f32, v: f32) -> [u8; 4] {
   img.get_pixel(px, py)
 }
 
-pub fn apply_tint(rgba: [u8; 4], _tint: i32) -> [u8; 4] {
-  let t = [0x91u8, 0xBDu8, 0x59u8];
+pub fn apply_tint(rgba: [u8; 4], tint: [u8; 3]) -> [u8; 4] {
   [
-    ((rgba[0] as u32 * t[0] as u32) / 255) as u8,
-    ((rgba[1] as u32 * t[1] as u32) / 255) as u8,
-    ((rgba[2] as u32 * t[2] as u32) / 255) as u8,
+    ((rgba[0] as u32 * tint[0] as u32) / 255) as u8,
+    ((rgba[1] as u32 * tint[1] as u32) / 255) as u8,
+    ((rgba[2] as u32 * tint[2] as u32) / 255) as u8,
     rgba[3],
   ]
 }
