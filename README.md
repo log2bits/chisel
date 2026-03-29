@@ -1,49 +1,62 @@
 # Chisel
 
-A Minecraft Java Edition world renderer built in Rust with wgpu/WebGPU and WGSL. Chisel voxelizes every Minecraft block into a 16x16x16 sub-voxel brick, stores the world in a Sparse Voxel DAG (SVDAG) that encodes both geometry and block identity, and renders it via GPU ray casting with hard shadows. Targets native (Vulkan/Metal/DX12) and WebAssembly + WebGPU.
+A Minecraft Java Edition world renderer built in Rust with wgpu/WebGPU and WGSL. Chisel packs any Minecraft world into a compact binary format backed by a globally deduplicated contree DAG, then renders it via GPU raycasting with hard shadows. Targets native (Vulkan/Metal/DX12) and WebAssembly + WebGPU.
 
 No game logic. No entity simulation. Renderer only. Minecraft-specific by design.
+
+### Benchmarks on Hermitcraft Season 10
+
+149,525 MC chunk columns, 43,587 chisel chunks, 1.15 GB raw uncompressed.
+
+| Format | Culling | File size | vs raw |
+|--------|---------|-----------|--------|
+| v13 contree | no | 492 MB | 0.43x |
+| v13 contree | yes | 223.65 MB | 0.19x |
+| v14 contree (current best) | yes | 170.92 MB | 0.15x |
+| v15 fat-leaf octree | yes | 182.42 MB | 0.16x |
+| raw NBT + zstd -9 (baseline) | - | 552 MB | 0.48x |
+
+v14 culled is the recommended format. It beats even raw NBT with zstd by 3x.
 
 ---
 
 ## Goals
 
-- Load any Minecraft Java Edition world from a zip file (all versions 1.13+, pre-1.13 planned)
-- Voxelize all block states into 16x16x16 bricks offline
-- Compress the world into a Sparse Voxel DAG encoding geometry and block IDs
-- Render via GPU ray casting with primary rays and hard shadows
+- Load any Minecraft Java Edition world from a zip file (1.13+, pre-1.13 planned)
+- Compress the world into a compact binary with a globally deduplicated contree DAG encoding geometry and block IDs separately
+- Render via GPU raycasting with primary rays and hard shadows
 - Run natively and in the browser via WebAssembly + WebGPU
-- Handle large worlds including multi-hundred-GB downloads
+- Handle large worlds
 
 ---
 
 ## Tech Stack
 
-| Concern         | Choice                               |
-|-----------------|--------------------------------------|
-| Language        | Rust                                 |
-| GPU API         | wgpu (WebGPU backend)                |
-| Shader language | WGSL                                 |
-| Build targets   | Native (Vulkan/Metal/DX12) + WASM    |
-| World format    | Minecraft Java Edition (Anvil .mca)  |
-| NBT parsing     | fastnbt crate (custom chunk decoder) |
-| World input     | Zipped world folders (.zip)          |
+| Concern | Choice |
+|---------|--------|
+| Language | Rust |
+| GPU API | wgpu (WebGPU backend) |
+| Shader language | WGSL |
+| Build targets | Native (Vulkan/Metal/DX12) + WASM |
+| World format | Minecraft Java Edition (Anvil .mca) |
+| NBT parsing | fastnbt crate (custom chunk decoder) |
+| World input | Zipped world folders (.zip) |
 
 ---
 
 ## Two Executables
 
-Chisel is split into two separate programs with a `.chisel` file as the handoff between them.
+Chisel is split into two separate programs with a single binary world file as the handoff between them.
 
-**chisel-pack** runs offline on your machine. It takes a zipped Minecraft world and produces a `.chisel` file. This is where all the heavy CPU work happens: reading NBT, voxelizing blocks, building and deduplicating the SVDAG. It can be multithreaded as aggressively as you want since it's offline.
+The packer runs offline on your machine. It takes a zipped Minecraft world and produces the world file. This is where all the heavy CPU work happens: reading NBT, building and deduplicating the DAG, encoding attributes. It can be multithreaded aggressively since it's offline.
 
-**chisel-render** takes a `.chisel` file and renders it. This is what runs in the browser via WASM, or natively. It doesn't know anything about Minecraft worlds. It just uploads the DAG to the GPU and traces rays.
+The renderer takes the world file and renders it. It's what runs in the browser via WASM, or natively. It doesn't know anything about Minecraft worlds. It uploads the DAG to the GPU and traces rays.
 
-So the workflow is:
+The workflow looks like this:
 
 ```
-[chisel-bake]   Minecraft jars -> block_states.bin + geometry.bin + materials.bin  (run once per MC version)
-[chisel-pack]   world.zip + geometry.bin + materials.bin -> world.chisel            (run once per world)
+[chisel-bake]   Minecraft jars -> block state data + geometry data + material data  (run once per MC version)
+[chisel-pack]   world.zip + geometry data + material data -> world.chisel           (run once per world)
 [chisel-render] world.chisel -> frames                                              (runs in browser or native)
 ```
 
@@ -51,466 +64,578 @@ So the workflow is:
 
 ## Architecture
 
-The pipeline inside chisel-pack:
+Inside the packer: the reader finds region files in the zip, decompresses chunks, decodes block names and properties, and maps them to numeric IDs. The packer takes those ID arrays, builds a bottom-up contree per chunk, deduplicates globally into a DAG, and serializes everything to disk.
+
+Inside the renderer: the loader uploads the DAG and material data to VRAM once at session start. The tracer raymarches through the DAG on the GPU every frame and handles lighting and shadows.
+
+The bake tool is separate. It reads the Minecraft client jar, voxelizes every block state into a 16x16x16 brick, and writes the block state mapping, geometry, and material data files that both the packer and renderer depend on.
+
+---
+
+## Coordinate System
+
+### Minecraft to Chisel Chunk Mapping
+
+Minecraft organizes blocks into several levels. A block is a single 1x1x1 voxel. Y ranges from -64 to 319 in modern Minecraft. A section is 16x16x16 blocks. A column is 16x16 blocks in XZ spanning all Y sections. A region file contains a 32x32 grid of columns.
+
+A chisel chunk is 64x64x64 blocks. You get a chisel chunk's coordinates by floor-dividing the Minecraft column coordinates and section Y by 4. So one chisel chunk covers a 4x4 grid of Minecraft columns in XZ and 4 vertical sections (64 blocks of height).
+
+Use floor division (Euclidean), not truncation. These are different for negative coordinates, which matter because Minecraft Y starts at -64.
+
+### Block Array Layout
+
+A chisel chunk's 64x64x64 block array is stored flat with X varying fastest and Z varying slowest:
 
 ```
-world.zip
-    |
-    v
-  [ Reader ]
-    Finds region files inside the zip,
-    decompresses chunks, decodes block
-    names + properties, maps to u16 IDs.
-    |
-    v
-  [ Packer ]
-    Builds a bottom-up SVO per chunk,
-    deduplicates globally into an SVDAG,
-    serializes to .chisel.
+index = x + y * 64 + z * 4096
 ```
 
-The pipeline inside chisel-render:
+Local coordinates are 0..63 on each axis.
+
+### Block State IDs
+
+Each unique combination of block type and properties gets a 16-bit block state ID (bsid). bsid 0 means air. The mapping is stored in the block state data file and generated by chisel-bake.
+
+---
+
+## Culling
+
+Before building the geometry DAG, we remove hidden voxels. A voxel is hidden if all 6 face-adjacent neighbors are fully opaque blocks. Removing them dramatically shrinks the geometry without changing what gets rendered.
+
+On Hermitcraft with culling:
+- Total voxels: 14.7 billion
+- Solid (non-air) before culling: 7.0 billion (47.5%)
+- Visible after culling: 463 million (3.16% of total)
+- Hidden solid blocks removed: 88%
+
+That 88% reduction directly makes the geometry DAG smaller and shrinks the attribute stream proportionally.
+
+The occlusion test needs the geometry and material data files to know which block states are fully opaque. Full-cube opaque blocks like stone and dirt occlude their neighbors. Transparent or partial blocks like glass, stairs, and slabs don't.
+
+Culling happens per chisel chunk. The 8 neighboring chunks are needed to correctly handle faces at chunk boundaries.
+
+---
+
+## Geometry: The Contree DAG
+
+### Why a Contree and Not an Octree
+
+Both were tested against the same data.
+
+An octree with 2^3 branching at depth 6 produces 7.6M unique nodes on Hermitcraft culled. A contree with 4^3 branching at depth 3 produces 4.8M unique nodes. That's 37% fewer total nodes.
+
+The contree wins because its 4^3 branching aggressively deduplicates the dense underground and terrain layers. One contree depth-2 node covers 16^3 voxels, which is equivalent to 3 octree levels, so the upper tree stays small.
+
+Per-level dedup stats for the contree (Hermitcraft, culled):
+
+| Depth | Voxels/node | SVO nodes | DAG nodes | Dedup |
+|-------|-------------|-----------|-----------|-------|
+| 1 | 4^3 | 18,078,831 | 4,135,279 | 77.1% |
+| 2 | 16^3 | 779,301 | 658,392 | 15.5% |
+| 3 | 64^3 | 20,731 | 20,708 | 0.1% |
+| Total | | 18,878,863 | 4,814,379 | 74.5% |
+
+For comparison, the octree has 92M SVO nodes vs the contree's 18M. The contree skips the octree's expensive depths 3-5 (about 3.5M unique upper nodes total) and replaces them with 658K contree depth-2 nodes.
+
+### Contree Structure
+
+Three levels:
+
+- Depth 3: 64x64x64 (root, one per chisel chunk)
+- Depth 2: 16x16x16 (up to 64 children per depth-3 node)
+- Depth 1: 4x4x4 (leaf level, stored as a 64-bit occupancy bitmask)
+
+### Slot Ordering
+
+Children of a node are identified by a slot number from 0 to 63:
 
 ```
-world.chisel + geometry.bin + materials.bin
-    |
-    v
-  [ Loader ]
-    Uploads SVDAG + material data to VRAM.
-    |
-    v
-  [ Tracer ]  (every frame)
-    Raymarches through the SVO on the GPU,
-    handles lighting and shadows.
+slot = dz * 16 + dy * 4 + dx     (dx, dy, dz each in 0..3)
 ```
 
-The Carver runs inside chisel-bake, not as part of world packing:
+X varies fastest (bits 0-1), Z slowest (bits 4-5). This ordering is consistent everywhere: in the geometry bit stream, in the attribute stream, and in the child list.
+
+### Node Representation (v14)
+
+Depth-1 nodes (4^3 = 64 voxels) are stored as plain 64-bit bitmasks. Bit `s` is set if the voxel at slot `s` is occupied. No child pointers. This is the leaf layer.
+
+Depth-2 and depth-3 (interior) nodes each have two fields:
+- A 64-bit child presence mask, where bit `s` is set if the child at slot `s` is non-empty
+- A 32-bit bit offset into the geometry bit stream pointing to this node's child IDs
+
+There's no leaf mask. In v13 there was a separate "fully occupied" sentinel value and a leaf mask to track which children were solid vs branch nodes. That's gone in v14. Fully-occupied regions are just regular nodes that happen to have all bits set in their bitmask, and they get naturally deduplicated down to a single entry like everything else. This saves 8 bytes per node at every depth and about 55 MB total on Hermitcraft.
+
+Building a node returns one of three things:
+- 0 for an empty subtree (nothing written to the parent's bit stream)
+- A 1-based leaf ID for depth-1 results
+- A 1-based interior node ID for depth-2 and depth-3 results
+
+Because depth is always known during traversal, there's no ambiguity between leaf IDs and interior node IDs. Depth-2 nodes always reference leaf IDs. Depth-3 nodes always reference depth-2 node IDs.
+
+### DAG Deduplication
+
+All chunks share one global structure. Two subtrees with identical occupancy converge to a single node. The hash key for an interior node is its child presence mask combined with the ordered list of non-empty child IDs. Use a fast hash map (not the default one, which is 2-3x slower for this workload) for both the leaf and interior node tables.
+
+### Building a Chunk (v14)
+
+Start at depth 1. For each of the 64 leaf tiles in the chunk, iterate over the 64 voxels and build a 64-bit occupancy bitmask. Intern it in the leaf hash map.
+
+For depth 2 and 3, the step size (voxels per child along each axis) is 4^(depth-1), so 4 at depth 2 going to depth 1, and 16 at depth 3 going to depth 2. For each of the 64 children, recurse. Build the child presence mask from the non-zero results. If the mask is empty, return 0. Otherwise collect the non-zero child IDs in slot order and intern in the interior node hash map.
+
+### Geometry Bit Stream
+
+For each interior node in intern order, iterate slots 0..63. For each slot where the child presence mask is set, write 25 bits (the child ID). All non-empty children get exactly 25 bits. No free entries for solid subtrees like in v13. All bits are written LSB-first within each byte.
+
+---
+
+## Attribute Encoding
+
+Attributes record the block type at each occupied voxel. Geometry tells you where; attributes tell you what. They're per-chunk and independent of the geometry DAG.
+
+### Stacked Palettes
+
+Within any small region, only a handful of block types appear. Three palette levels stack:
+
+- Chunk palette (64^3 scope): ~100-200 unique types, ~7-8 bits per index
+- Regional sub-palette (16^3 scope): ~10-30 unique types, ~4-5 bits per index
+- Tile inline palette (4^3 scope): ~2-5 unique types, ~1-3 bits per index
+
+Each level narrows the type set. The bits-per-entry calculation is `ceil(log2(K))`, with 0 bits for palettes of size 0 or 1 (you don't need to write any index when there's only one option).
+
+### Per-Chunk Attribute Data Layout
+
+Empty chunks have no attribute data.
 
 ```
-Minecraft client jar
-    |
-    v
-  [ Carver ]  (inside chisel-bake, run once per MC version)
-    Loads models + textures from the client jar,
-    voxelizes every block state into a 16x16x16 brick,
-    writes geometry.bin + materials.bin.
+[2 bytes]          palette length (u16)
+[palette_len * 2]  block state IDs, sorted by frequency descending
+[64 * 4 bytes]     depth-2 bit offsets: one u32 per depth-2 slot
+[variable]         bit stream, LSB-first
 ```
+
+The 256-byte depth-2 offset table is what enables O(1) random access to any 16^3 region on the GPU. Each entry holds the bit offset in the stream where that depth-2 slot's mixed node begins. All-uniform or empty slots use a sentinel value of 0xFFFFFFFF.
+
+### Bit Stream Content
+
+The root (64^3 scope) can be:
+- All air: no data
+- All one type: a single flag bit set to 1, then the chunk palette index in `ceil(log2(palette_len))` bits
+- Mixed: a single flag bit set to 0, then 64 depth-2 children in slot order
+
+Each depth-2 child (16^3 region) can be:
+- Empty: nothing written
+- Uniform: flag bit 1, then the chunk palette index
+- Mixed: the depth-2 offset table points here; flag bit 0, then the regional sub-palette, then 64 depth-1 children
+
+A mixed depth-2 node writes:
+- 6 bits for the count of unique types in this region
+- That many chunk palette indices (the regional type list, in first-seen order)
+- Then all 64 depth-1 children
+
+Each depth-1 child (4^3 tile) can be:
+- Empty: nothing
+- Uniform: flag bit 1, then the regional palette index
+- Mixed: flag bit 0, then the inline tile palette, then per-voxel data
+
+A mixed depth-1 tile writes:
+- 6 bits for the count of unique types in this tile
+- That many regional palette indices (the tile type list, in first-seen order)
+- For each occupied voxel in slot order: a tile palette index in `ceil(log2(K_tile))` bits
+
+Only occupied voxels appear in the tile data. Air is skipped. The decoder uses the geometry tree to know which voxel slots are occupied, so geometry and attributes must be traversed in parallel in the same DFS order.
+
+### Attribute Compression Results
+
+| Variant | Total attribute bytes |
+|---------|-----------------------|
+| Raw block state ID per occupied voxel | several GB |
+| Chunk palette only | 1.34 GB |
+| + 4^3 inline tile palette | 419 MB |
+| + 16^3 regional sub-palette | 398 MB |
+| + depth-2 offset table (v13/v14) | 403 MB |
+| Above + culling (v14) | 73.75 MB |
+
+The inline tile palette is by far the biggest win. The 256-byte offset table adds about 5 MB total overhead but enables O(1) GPU random access, well worth it.
+
+Super-chunk palettes at 128^3 scope were tested. They're 0.81 MB worse because the larger palette increases bits per index more than it saves on palette header count. 64^3 is the sweet spot.
+
+---
+
+## File Format
+
+All integers are little-endian. Bit streams are LSB-first per byte.
+
+### Header (32 bytes)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Magic "CHSL" |
+| 4 | 4 | Version 14 (u32) |
+| 8 | 4 | Chunk count (u32) |
+| 12 | 4 | Leaf count (u32), unique depth-1 bitmask leaves |
+| 16 | 4 | Interior node count (u32), depth-2 and depth-3 nodes |
+| 20 | 4 | Geometry bit stream byte length (u32) |
+| 24 | 4 | Total attribute data byte length (u32) |
+| 28 | 4 | Reserved (0) |
+
+### Chunk Index (24 bytes per chunk)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Chunk X coordinate (i32) |
+| 4 | 4 | Chunk Y coordinate (i32) |
+| 8 | 4 | Chunk Z coordinate (i32) |
+| 12 | 4 | Geometry root (u32): 0 = empty chunk, else 1-based depth-3 node ID |
+| 16 | 4 | Attribute data byte offset (u32) |
+| 20 | 4 | Attribute data byte length (u32), 0 if all air |
+
+No sentinel value for the geometry root in v14. An entirely solid chunk just gets a specific node ID like any other.
+
+### Leaf Array (8 bytes per leaf)
+
+One 64-bit occupancy bitmask per unique 4^3 leaf, in intern order. The first leaf ID is 1, stored at index 0.
+
+### Interior Node Array (12 bytes per node)
+
+One entry per unique depth-2 or depth-3 node, in intern order. The first node ID is 1, stored at index 0.
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Bit offset of this node's children in the geometry bit stream (u32) |
+| 4 | 8 | Child presence mask (u64) |
+
+12 bytes per node vs 20 bytes in v13, because there's no leaf mask.
+
+### Geometry Bit Stream
+
+For each interior node in intern order, starting at its recorded bit offset: iterate slots 0..63. For each slot where the child presence mask is set, write 25 bits representing the child ID. Depth-2 nodes write leaf IDs. Depth-3 nodes write depth-2 node IDs.
+
+### Attribute Data Section
+
+Per-chunk attribute data concatenated. Each chunk's data starts at its recorded byte offset. Format is as described in the Attribute Encoding section. Identical between v13 and v14.
+
+---
+
+## Geometry Traversal (v14)
+
+Look up the chunk by its chisel coordinates to get the depth-3 root node ID. A root of 0 means the chunk is empty.
+
+Start with the local voxel coordinates (0..63 on each axis). At depth 3 and depth 2, index into the interior node array. Compute the step size: at depth 3, each child covers 16x16x16 voxels; at depth 2, each child covers 4x4x4 voxels. Divide the local coordinate by the step to get the child offset on each axis, and reduce the local coordinate to the remainder. Compute the slot from the offsets. If the child presence mask has that slot clear, the voxel is empty. Otherwise, count the number of set bits before that slot in the mask. The child ID is 25 bits starting at `bit_offset + children_before * 25` in the geometry bit stream.
+
+At depth 2, that child ID is a leaf ID. Load the leaf bitmask and check the final slot bit. At depth 3, that child ID is an interior node ID. Continue to depth 2.
+
+### Geometry Traversal (v13, legacy)
+
+Same as v14 but with 3 levels of interior nodes instead of 2 levels + a leaf array. Each node has a leaf mask in addition to the child presence mask. A child with its bit set in both masks is a fully-occupied subtree. A child with its bit set only in the presence mask is a branch node. Traversal reads a 25-bit node ID from the bit stream for branch children only, not for solid subtrees.
+
+---
+
+## Attribute Traversal
+
+Load the chunk's attribute header: palette length, palette entries, bits-per-index from that palette length, and the 64-entry depth-2 offset table.
+
+To look up a specific voxel's block type, compute its depth-2 slot from the local coordinates. Check the offset table. If the sentinel value, the 16^3 region is uniform or empty. Otherwise, seek to that bit offset in the stream.
+
+Read the mixed depth-2 node: 6 bits for the regional type count, then that many chunk palette indices. Now compute the depth-1 slot within the 16^3 region. Skip all depth-1 tiles before the target (each is either empty, uniform with a known bit cost, or mixed with a known size). Decode the target tile the same way.
+
+For the mixed tile: read 6 bits for tile type count, then that many regional palette indices. Skip occupied voxels before the target in slot order. Read the tile palette index, then the regional index, then the chunk palette index to get the final block state ID.
+
+---
+
+## Building the Packer: Step by Step
+
+### 1. World Scanning
+
+Open the world zip and find all region files. Parse the 4096-byte location table (1024 entries: 3-byte sector offset + 1-byte sector count). Decompress each chunk (zlib, gzip, or zstd depending on version), parse NBT, extract block sections. Convert block palette strings to block state IDs using the block state data file.
+
+Assemble chisel chunks: one 64^3 block array per chisel chunk coordinate by copying from the Minecraft sections it covers. Use a seen-set to avoid processing the same chisel chunk twice (possible at region file edges).
+
+### 2. Culling
+
+Load the geometry and material data files to build the occlusion table. For each chisel chunk, mark voxels hidden if all 6 face-adjacent voxels (including across chunk boundaries) are fully opaque, and set those voxels to air. This reduces visible solid voxels by ~88%.
+
+### 3. Geometry DAG Construction
+
+For each chisel chunk, build the contree bottom-up. Compute a 64-bit occupancy bitmask for each of the 64 leaf tiles (4^3 voxel regions). Intern each bitmask in the global leaf hash map.
+
+Build depth-2 nodes: 64 children per node, each a leaf ID or 0. Build the child presence mask from non-zero children. If it's all zeros, the node is empty. Otherwise intern in the interior node hash map, keyed on the presence mask plus the ordered list of child IDs.
+
+Build the depth-3 root node the same way, with depth-2 node IDs as children.
+
+### 4. Attribute Stream Construction
+
+For each chisel chunk, scan all occupied blocks to build the chunk palette sorted by frequency descending. Traverse the contree depth 3 to 2 to 1. At each mixed depth-2 node, record the current bit offset. Write the regional sub-palette for that 16^3 region. Write the inline tile palette and per-voxel indices for each mixed depth-1 tile.
+
+### 5. File Writing
+
+Write the 32-byte header, then the chunk index (one 24-byte entry per chunk), then the leaf array, then the interior node array. Compute each node's bit offset while iterating by accumulating how many children each node contributes. Then write the geometry bit stream, and finally concatenate all per-chunk attribute blobs.
+
+---
+
+## Key Implementation Notes
+
+A geometry root of 0 is the only special value (empty chunk). All other geometry root values are 1-based depth-3 node IDs. There's no sentinel for fully-solid chunks. A fully-solid chunk just has a specific node ID.
+
+Depth determines the child type during traversal. Depth-2 children are always leaf IDs. Depth-3 children are always depth-2 node IDs. No flag bits needed.
+
+All IDs are 1-based. The first leaf or node in the array is at index 0 but has ID 1.
+
+Slot ordering is consistent everywhere. Use the same `dz*16 + dy*4 + dx` formula for the bit stream, the attribute bit offset table, and the child list.
+
+The attribute stream has no self-contained way to know which voxels are occupied. That information comes from the geometry leaf bitmask. The decoder must traverse geometry and attributes in parallel in the same DFS order.
+
+A sub-palette with exactly one entry encodes all indices in 0 bits. Make sure your encoder and decoder handle this correctly.
 
 ---
 
 ## Static Data Files
 
-Three binary files live in `data/` and are produced by `chisel-bake`. They're committed to the repo and only need to be regenerated when the Minecraft version changes.
+Three binary files live in the data directory and are produced by chisel-bake. They're committed to the repo and only need to be regenerated when the Minecraft version changes.
 
-### block_states.bin
+### Block State Data
 
-Maps every block state string to a stable u16 ID. Used by the Reader at world-load time to convert chunk NBT strings like `"minecraft:grass_block[snowy=false]"` into numeric IDs. Once world loading is done this file can be freed from memory.
+Maps every block state string to a stable 16-bit ID. Used by the reader to convert chunk NBT strings into numeric IDs. Once world loading is done this file can be freed from memory.
+
+The key string format is the block name for blocks with no properties, or the block name followed by sorted alphabetically-keyed properties in square brackets. The `minecraft:` namespace prefix is stripped. ID 0 is reserved for air.
+
+Measured from Minecraft 1.21.11: 29,671 total block states. File size: ~2.4 MB.
 
 Format:
 ```
-[4 bytes]  magic: 0x42534944 ("BSID")
+[4 bytes]  magic "BSID"
 [4 bytes]  u32 entry count
 for each entry:
-  [2 bytes]  u16 block state id
+  [2 bytes]  u16 block state ID
   [2 bytes]  u16 string length
-  [n bytes]  utf8 key string
+  [n bytes]  UTF-8 key string
 ```
 
-The key string format is `"block_name"` for blocks with no properties, or `"block_name[prop1=val1,prop2=val2]"` with properties sorted alphabetically. The `minecraft:` namespace prefix is stripped.
+### Geometry Data
 
-Measured from Minecraft 1.21.11: 29,671 total block states. A u16 is sufficient with headroom. `BlockStateId = 0` is reserved for air.
+Maps every block state ID to a deduplicated 16x16x16 voxel geometry shape. Hot path during traversal, sized to fit in GPU L2 cache.
 
-File size: ~2.4 MB.
+29,671 block states collapse to ~1,553 unique shapes after deduplication. Many blocks share the same geometry (all fully-solid blocks share one all-ones bitmask).
 
-### geometry.bin
-
-Maps every u16 BlockStateId to a deduplicated voxel geometry shape. The geometry section is the hot path during ray traversal and is sized to fit in GPU L2 cache.
-
-Bitmask shapes are deduplicated across all block states: 29,671 block states collapse to ~1,553 unique shapes. Many blocks share the same 16x16x16 geometry (e.g. all fully-solid blocks share one all-ones bitmask).
-
-Format:
-```
-[4 bytes]             magic "GEOM"
-[4 bytes]             u32 count (number of block state slots = max_id + 1)
-[4 bytes]             u32 num_shapes (number of unique bitmask shapes)
-[count * 2 bytes]     u16 bitmask_id per block state (index into shape table)
-[num_shapes * 520 bytes]  shape table, each entry:
-  [8 bytes]   coarse bitmask (u64, one bit per 4x4x4 sub-region)
-  [512 bytes] geometry bitmask (4096 bits, one per voxel)
-```
-
-GPU lookup:
-```
-bitmask_id = bitmask_ids[block_state_id]        // ~58 KB, fits in L1
-shape      = shape_table[bitmask_id]            // ~203 KB, fits in L2
-coarse     = shape.coarse
-bitmask    = shape.bitmask
-```
-
-Bitmask bit indexing:
-```
-flat_idx = x + y*16 + z*256
-word:  bitmask[flat_idx / 32]
-bit:   (word >> (flat_idx % 32)) & 1
-```
+Each shape has two parts: a coarse bitmask (one bit per 4x4x4 sub-region) and a full bitmask (one bit per voxel). The coarse bitmask lets the GPU skip empty 4x4x4 regions during brick traversal.
 
 Total size: ~847 KB.
 
-### materials.bin
+Format:
+```
+[4 bytes]               magic "GEOM"
+[4 bytes]               u32 block state slot count (max ID + 1)
+[4 bytes]               u32 unique shape count
+[slot_count * 2 bytes]  u16 shape index per block state
+[shape_count * 520 bytes] shape table:
+  [8 bytes]   coarse bitmask (u64, one bit per 4x4x4 sub-region)
+  [512 bytes] full bitmask (4096 bits, one per voxel)
+```
 
-Maps every u16 BlockStateId to palette-compressed color data for its solid voxels. This is the cold path - accessed only when a ray hits a block. Geometry (bitmask/coarse) is in geometry.bin.
+Voxel bitmask indexing: `flat_idx = x + y*16 + z*256`. Then word is `bitmask[flat_idx / 32]`, bit is `(word >> (flat_idx % 32)) & 1`.
 
-The IDs in `block_states.bin`, `geometry.bin`, and `materials.bin` are derived from the same `blocks.json` and always match as long as all three are generated together by `chisel-bake`.
+### Material Data
 
-Color payloads are deduplicated across all block states: 26,606 non-empty block states collapse to 16,904 unique color payloads. Many block states share identical visual data despite having different behavioral properties (e.g. all redstone power levels, all note block instrument/note combinations, all waterlogged variants of the same block type). This mirrors the bitmask deduplication in geometry.bin.
+Maps every block state ID to palette-compressed color data for its solid voxels. Cold path, accessed only when a ray hits a block.
 
-Color_id 0 is a sentinel meaning "no color data" (empty/air block). Valid color_ids are 1..=num_payloads.
+26,606 non-empty block states collapse to 16,904 unique color payloads after deduplication. Many block states share identical visual data despite different behavioral properties (all redstone power levels, all note block combinations, all waterlogged variants of the same block, etc.).
+
+Color indices are stored only for solid voxels. The index for a given voxel is computed via popcount on the geometry bitmask up to that voxel's position.
 
 Format:
 ```
-[4 bytes]              magic "MATL"
-[4 bytes]              u32 count (number of block state slots = max_id + 1)
-[4 bytes]              u32 num_payloads (number of unique color payloads)
-[count * 2 bytes]      color_id per block state (u16, 0 = no color data)
-[num_payloads * 4 bytes] payload byte offsets (u32, from start of payload data section)
-[variable]             payload data, one entry per unique payload:
-  [4 bytes]              meta: palette_count (8 bits) | solid_voxel_count (16 bits) | flags (8 bits)
-                           flags bit 0: is_emissive (block emits light)
-  [N * 4 bytes]          palette: RGBA8 entries, N = unique colors (1–256)
-  [M bytes]              indices: 8-bit palette index per solid voxel, in popcount order
+[4 bytes]               magic "MATL"
+[4 bytes]               u32 block state slot count (max ID + 1)
+[4 bytes]               u32 unique payload count
+[slot_count * 2 bytes]  u16 payload ID per block state (0 = no color data)
+[payload_count * 4]     u32 byte offsets into payload data section
+[variable]              payload data, one entry per unique payload:
+  [4 bytes]               meta: palette count (8 bits) | solid voxel count (16 bits) | flags (8 bits)
+                            flags bit 0: emissive (block emits light)
+  [N * 4 bytes]           palette: RGBA8 entries, N = unique colors (1-256)
+  [M bytes]               indices: 8-bit palette index per solid voxel, in popcount order
 ```
 
-GPU lookup:
-```
-color_id      = color_ids[block_state_id]         // ~58 KB, fits in L1
-payload_off   = payload_offsets[color_id - 1]     // ~66 KB for ~17K payloads
-payload       = payload_data[payload_off..]        // palette + indices
-```
-
-Color indices are stored only for solid voxels. The index into the color array for a given voxel is computed via popcount on the geometry bitmask up to that voxel's position.
-
-Measured from Minecraft 1.21.11:
-```
-26,606 non-empty block states
-16,904 unique color payloads (after deduplication)
-19,900 unique RGBA colors across all voxelized blocks
-Total payload data:    ~39.1 MB
-Total materials.bin:   ~39.3 MB (was ~55.2 MB without deduplication)
-Savings:               ~15.9 MB (29% reduction)
-```
+Total size: ~39.3 MB.
 
 ---
 
 ## chisel-bake
 
-`chisel-bake` is the data preparation tool. Run it once when the Minecraft version changes. It requires the Minecraft server jar and client jar in `jars/`.
-
-```
-cargo run --bin chisel-bake
-```
+The bake tool is the data preparation step. Run it once when the Minecraft version changes. It needs both the Minecraft server jar and client jar.
 
 It does three things in order:
 
-1. Runs the Minecraft data generator via subprocess (`java -DbundlerMainClass=net.minecraft.data.Main`) to produce `blocks.json`, then deletes the temp files.
-2. Parses `blocks.json` and writes `data/block_states.bin`.
-3. Runs the Carver against the client jar to produce `data/geometry.bin` and `data/materials.bin`.
+1. Runs the Minecraft data generator to produce the block state listing.
+2. Parses that listing and writes the block state data file.
+3. Runs the voxelizer against the client jar to produce the geometry and material data files.
 
-All output goes to `data/`. All temp files are cleaned up automatically.
+All output goes to the data directory. Temp files are cleaned up automatically.
 
 ---
 
 ## Reader
 
-The Reader lives in `chisel-core` and is called by `chisel-pack`. It takes a path to a zipped Minecraft world and produces decoded chunks: for each chunk, a list of sections each containing a flat `[u16; 4096]` of BlockStateIds.
+The reader lives in chisel-core and is called by chisel-pack. It takes a path to a zipped Minecraft world and produces decoded chunks: for each chunk, a list of sections each containing a flat array of block state IDs.
 
 ### World Input
 
-The Reader accepts zip files containing Minecraft worlds in any of these layouts:
+The reader accepts zip files with Minecraft worlds in any of these layouts:
 
-- `WorldName/region/r.X.Z.mca` (zipped folder)
-- `region/r.X.Z.mca` (zipped contents)
-- `r.X.Z.mca` (just the region files)
+- Zipped folder with region files under a named world folder
+- Zipped contents with region files under a `region` directory
+- Just the raw region files at the zip root
 
-It only reads overworld region files. It identifies them by finding `.mca` files whose immediate parent directory is named `"region"`, or `.mca` files at the root of the zip with no parent. `entities/` and `poi/` directories are skipped. Nether and End dimensions are skipped for now.
+It only reads overworld region files. Files in `entities/`, `poi/`, Nether, and End dimensions are skipped.
 
 ### Why Not fastanvil
 
-The fastanvil crate only supports 1.13 through ~1.20, has flaky 1.12 support, is pre-1.0 and unstable, and doesn't expose all chunk data. The 2b2t 1170 GB world download is on Minecraft 1.12, which predates the Flattening. fastanvil can't reliably parse it.
+fastanvil only supports 1.13 through ~1.20, has flaky 1.12 support, and doesn't expose all chunk data. The 2b2t 1170 GB world download is on Minecraft 1.12, which predates the Flattening. fastanvil can't reliably parse it.
 
-Chisel uses fastnbt (the low-level NBT serde crate) directly and implements its own chunk decoder. This gives full control over every version's block format.
+Chisel uses fastnbt directly and implements its own chunk decoder. Full control over every version's block format.
 
 ### Chunk Format Versions
 
-Each chunk stores a `DataVersion` integer. The Reader branches on it to pick the right decoder:
+Each chunk stores a version integer. The reader branches on it to pick the right decoder:
 
-```
-DataVersion < 1444 (before 1.13, "pre-flattening"):
-  Block data: flat Blocks byte array (8-bit block ID per voxel)
-              plus optional Add nibble array (4-bit extension for IDs > 255)
-              plus Data nibble array (4-bit metadata per voxel)
-  ID mapping: numeric (block_id, metadata) -> modern block state string
-              via a static pre-flattening lookup table in legacy.rs
-  Status: TODO
-
-DataVersion 1444 to 2563 (1.13 through 1.15):
-  Block data: per-section palette (list of block state name strings + properties)
-              plus paletted BlockStates long array
-  Packing: indices CAN span across two longs (cross-long packing)
-  Y range: 0 to 255 (16 sections)
-
-DataVersion 2564+ (1.16+):
-  Block data: same palette format as 1.13-1.15
-  Packing: indices never span longs, padding bits are wasted
-  Y range: 0 to 255 for 1.16-1.17, -64 to 319 for 1.18+ (24 sections)
-  Section Y stored explicitly in each section compound
-```
-
-### Block State ID Assignment
-
-Regardless of input version, all blocks are normalized to a `BlockStateId` (u16) by looking them up in a `BlockStateTable` loaded from `data/block_states.bin`. The table maps canonical key strings to IDs.
-
-Key string format: `"stone"` for blocks with no properties, `"acacia_button[face=floor,facing=north,powered=true]"` with properties sorted alphabetically. The `minecraft:` namespace prefix is stripped.
-
-The `build_block_key(name, properties)` function in `block_state.rs` is public and used by both the Reader and `chisel-bake` to build these strings consistently.
+- Before 1.13 (pre-flattening): flat block ID array plus a metadata nibble array per section, mapped through a static legacy lookup table. Status: TODO.
+- 1.13 through 1.15: per-section block palette (list of block state name strings and properties) plus a paletted long array. Indices can span across two longs.
+- 1.16+: same palette format, but indices never span longs and padding bits are wasted. Y range changes from 0-255 in 1.16-1.17 to -64 to 319 in 1.18+.
 
 ---
 
 ## Carver
 
-The Carver runs inside `chisel-bake`. It takes the Minecraft client jar, reads model JSON and texture files directly out of it, and voxelizes every block state into a 16x16x16 brick.
+The carver runs inside chisel-bake. It reads model JSON and texture files directly from the Minecraft client jar and voxelizes every block state into a 16x16x16 brick.
 
-### Voxelization Technique
+### Voxelization
 
-The Carver uses a quad-intersection approach.
+The carver uses a quad-intersection approach:
 
-**1. Build the color palette.** Read all the textures the block needs and collect every unique RGBA color across all of them. This becomes the block's palette. The max number of unique colors across all textures on a single block in Minecraft 1.21.11 is 219, so an 8-bit palette index always works.
+**1. Build the color palette.** Read all textures the block needs and collect every unique RGBA color. This is the block's palette. The max unique colors across all textures on a single block in 1.21.11 is 219, so an 8-bit palette index always works.
 
-**2. Resolve the model.** Parse the blockstate JSON to find which model(s) apply. For variant blocks a single model is selected by matching the block's property key. For multipart blocks (fences, walls, chorus plants, etc.) all entries whose `when` condition matches the block's properties are collected - including OR conditions and pipe-separated values - and their quads are merged before voxelization. Follow each model's parent chain (most models inherit from a parent like `block/cube_all`) until you have a complete set of elements with all texture variables resolved. Texture variables like `#side` get substituted through the model's `textures` map.
+**2. Resolve the model.** Parse the blockstate JSON to find which models apply. For variant blocks a single model is selected by matching properties. For multipart blocks (fences, walls, chorus plants, etc.) all entries whose conditions match are collected and their quads merged. Follow each model's parent chain until you have a complete set of elements with all texture variables resolved.
 
-**3. Decompose into quads.** Each element in the model JSON is a rectangular prism with a `from` and `to` in 0–16 unit space. Generate up to 6 quads per prism (one per face). For volumetric faces, shift each quad 0.5 units inward toward the prism center and trim 0.5 units from all four edges in the face plane, so the quad strictly intersects the shell voxels' interiors rather than touching boundaries. Zero-thickness quads (like the grass cross-plane or iron chain) skip the shift and trim. Zero-thickness quads that sit exactly on an integer voxel boundary are nudged 0.5 units into an adjacent voxel so the SAT intersection test can find them - nudged away from the block center (outward) by default, or inward if the quad is at the block border (position 0 or 16).
+**3. Decompose into quads.** Each element in the model JSON is a rectangular prism. Generate up to 6 quads (one per face). For volumetric faces, shift each quad 0.5 units inward and trim 0.5 units from all four edges so it strictly intersects shell voxels rather than touching boundaries. Zero-thickness quads (grass cross-planes, iron chain, etc.) skip the shift and trim. Zero-thickness quads sitting exactly on an integer voxel boundary get nudged 0.5 units into an adjacent voxel so the intersection test can find them.
 
-**4. Intersect quad-major.** For each quad, compute its voxel bounding box and test only the voxels within it using a full SAT (Separating Axis Theorem) intersection test. Strict intersection only - a quad touching a voxel face or edge without entering its interior doesn't count. This visits far fewer voxels than looping all 4096 for every quad.
+**4. Intersect quad-major.** For each quad, compute its voxel bounding box and test only the voxels inside it using SAT (Separating Axis Theorem). Strict intersection only. This visits far fewer voxels than testing all 4096 per quad.
 
-**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad's element plane (undoing element rotation, then blockstate rotation) and check that the projected point falls within the element's bounds in the face plane - this rejects edge voxels whose bounding boxes clip the quad but whose centers lie outside it (common with rotated thin quads like chain links). Then use the model's UV coordinates to look up the nearest texture pixel and average all sampled RGBA values if multiple quads hit the same voxel. Transparent pixels (alpha = 0) are skipped entirely.
+**5. Sample and average colors.** For each intersecting quad, project the voxel center onto the quad's plane (undoing element rotation, then blockstate rotation) and check that the projected point falls within the element's bounds. This rejects edge voxels whose bounding boxes clip the quad but whose centers lie outside it, which is common with rotated thin quads. Use the model's UV coordinates to look up the nearest texture pixel and average all sampled RGBA values if multiple quads hit the same voxel. Transparent pixels (alpha = 0) are skipped entirely.
 
-**6. Snap to palette.** Find the nearest palette color to the averaged RGBA result. That index becomes the voxel's material value.
+**6. Snap to palette.** Find the nearest palette color to the averaged result. That index is the voxel's material value.
 
-Interior voxels that no quad passes through stay empty. A full solid cube ends up with roughly 1,352 solid voxels out of 4,096, which falls out of the algorithm for free.
+Interior voxels that no quad passes through stay empty. A full solid cube ends up with roughly 1,352 solid voxels out of 4,096, which falls out of the algorithm naturally.
 
-**Fluids (water and lava).** These blocks have no usable model in the client JAR - they're rendered procedurally at runtime. The Carver handles them as solid rectangular prisms. The height is derived from the `level` property: level 0 (source) and levels 8+ (falling) are full height (16 voxels); flowing levels 1–7 fill `(8 - level) * 2` voxels from the bottom. The top surface samples the `water_still` / `lava_still` texture per-voxel at (x, z). Side voxels on the outer ring sample the `water_flow` / `lava_flow` texture. Water colors are tinted to the plains biome water color (`#3F76E4`). Lava is marked emissive.
+**Fluids.** Water and lava have no usable model in the client jar. The carver handles them as solid rectangular prisms. Height is derived from the level property: source blocks and falling blocks (level 0 and 8+) are full height; flowing levels 1-7 fill `(8 - level) * 2` voxels from the bottom. Top surface voxels sample the still texture per-voxel. Side voxels on the outer ring sample the flow texture. Water is tinted to the plains biome water color. Lava is marked emissive.
 
-**Waterlogged blocks.** Any block state with `waterlogged=true` gets a two-pass treatment: first the block is voxelized normally via the model pipeline, then every voxel that the geometry left empty is filled with the `water_still` texture color, tinted to plains biome water color. This correctly fills the hollow space in waterlogged slabs, stairs, fences, etc.
+**Waterlogged blocks.** Any block state with `waterlogged=true` gets two passes: first the block is voxelized normally, then every empty voxel left by the model is filled with the still water texture color, tinted to plains biome water color. This correctly fills the hollow space in waterlogged slabs, stairs, fences, etc.
 
-**Biome tinting.** All tintable faces (those with `tintindex` in the model JSON) use plains biome colors: grass colormap `#91BD59`, foliage colormap `#77AB2F`. Overlay textures (e.g. the grass-colored side overlay on `grass_block`) are alpha-composited over the base texture rather than averaged, so the grass pattern correctly overlays the dirt base.
+**Biome tinting.** All tintable faces use plains biome colors. Overlay textures (like the grass-colored side overlay on a grass block) are alpha-composited over the base texture rather than averaged.
 
-**Emissive flag.** One bit per brick in the materials.bin `flags` byte (`meta & 1`) marks whether the block emits light. The GPU is responsible for interpreting this however it sees fit (bloom, screen-space glow, full-bright shading, etc.). Emissive blocks include glowstone, sea lantern, fire, torches, lava, and similar light sources. Some blocks are conditionally emissive based on properties (e.g. furnaces are only emissive when `lit=true`).
-
----
-
-## Packer
-
-The Packer takes the Reader's BlockStateId arrays and the material lookup from `materials.bin` and compresses the whole world into an SVDAG. It processes one region file at a time so peak memory stays bounded.
-
-### Construction
-
-```
-For each .mca region file:
-  1. Decompress each chunk with fastnbt
-  2. Decode block data according to DataVersion
-  3. Map each block to BlockStateId (u16) via BlockStateTable
-  4. For each chunk in the region:
-     a. Build a flat 3D array of u16 leaf values
-     b. Construct octree bottom-up:
-        Leaf level: group 2x2x2 blocks -> create SvoNode
-        Each parent level: group 2x2x2 children -> create SvoNode
-        Before inserting any node, check global hash table for duplicates
-        Reuse existing node ID if found, allocate new if not
-     c. Bottom-up pass: compute face colors for each new inner node
-        from children's cached face colors
-     d. Store chunk root NodeId in chunk table
-  5. Discard region working data, continue to next file
-```
-
-Deduplication key includes block state IDs. Two nodes are identical iff every field matches including all descendant block state IDs.
-
-Reference: Kampe, Sintorn, Assarsson, "High Resolution Sparse Voxel DAGs" (ACM TOG 2013).
-
-### Chunk Structure
-
-The world is divided into chunks, each one the root of one independent octree. Chunk size is set by the octree depth, currently depth 6 = 64x64x64 blocks per chunk.
-
-Minecraft 1.18+ worlds span Y = -64 to 320 (384 blocks). The chunk grid covers this full vertical range.
-
-### Why Geometry and Block IDs Live in the Same DAG
-
-Most SVDAG papers separate geometry from color because continuous 24-bit RGB has so much entropy that including color in the hash key makes every leaf unique and destroys deduplication.
-
-Minecraft is different. Block state IDs have low entropy. Stone alone makes up 60-70% of non-air blocks underground. Including the block state ID in the hash key doesn't hurt deduplication. It actually helps, because the most common subtrees are homogeneous regions of the same block and those deduplicate perfectly.
-
-The combined DAG also gives you hierarchical dictionary compression for free:
-```
-All-stone 2x2x2 region -> one canonical node, shared everywhere
-All-stone 4x4x4 region -> one canonical node pointing to above
-All-stone 8x8x8 region -> one canonical node pointing to above
-...and so on up the tree
-```
-
-This is better than RLE because deduplication is global across the entire world, not local to a single scan line.
-
-### SVDAG Inner Node Format
-
-```rust
-#[repr(C)]
-pub struct SvoNode {
-  pub first_child: u32,      // index into child_ids array
-  pub child_mask:  u8,       // which of 8 octants are non-empty
-  pub leaf_mask:   u8,       // which non-empty children are brick leaves
-  pub flags:       u8,       // reserved
-  pub _pad:        u8,
-  pub face_colors: [u8; 18], // 6 * RGB888, one per axis face (+X -X +Y -Y +Z -Z)
-  pub _pad2:       [u8; 2],
-}
-// Total: 28 bytes
-```
-
-`leaf_mask` is always a subset of `child_mask`.
-
-Child slot interpretation:
-```
-child_mask[i] = 0                     -> octant i is empty air
-child_mask[i] = 1, leaf_mask[i] = 1  -> octant i is a brick leaf
-child_mask[i] = 1, leaf_mask[i] = 0  -> octant i is a branch node
-```
-
-Branch children are stored contiguously in a `child_ids` array. Leaf children are stored contiguously in a `leaf_data` array. Both are indexed via `first_child` + popcount offset.
-
-```
-branch_mask  = child_mask & !leaf_mask
-branch range = child_ids[first_child .. first_child + popcount(branch_mask)]
-
-leaf_mask_before_slot = leaf_mask & ((1 << slot) - 1)
-leaf index            = leaf_data[first_leaf + popcount(leaf_mask_before_slot)]
-```
-
-### SVDAG Leaf Node Format
-
-Each leaf is a single u16, a direct index into the material lookup.
-
-```
-block_state_id: u16 (0 to 65535)
-```
-
-No rotation bits. No tint index. No flags. Everything about how the block looks is already baked into the material entry at that index.
-
-In the GPU buffer, leaves are packed two per u32:
-```
-leaf_data[i] = (block_state_id_1) | (block_state_id_2 << 16)
-```
+**Emissive flag.** One bit in the material data flags byte marks whether a block emits light. The GPU interprets this however it wants (bloom, full-bright shading, etc.). Emissive blocks include glowstone, sea lantern, fire, torches, lava, and similar. Some blocks are conditionally emissive based on their properties (furnaces are only emissive when lit).
 
 ---
 
-## .chisel File Format
-
-The `.chisel` file is the handoff between `chisel-pack` and `chisel-render`. It contains the full SVDAG and chunk root table. It does not contain material data; that's loaded separately from `materials.bin`.
-
-Format TBD as the Packer is implemented.
-
----
-
-## Loader
-
-The Loader takes the `.chisel` file and `materials.bin` and uploads everything into VRAM as GPU storage buffers. This happens once at session start.
+## Renderer
 
 ### GPU Buffers
 
-```
-svo_nodes        : array<SvoNode>   // 28 bytes each (geometry + face colors)
-child_ids        : array<u32>       // branch child node indices
-leaf_data        : array<u32>       // u16 block_state_ids packed 2 per u32
-chunk_roots      : array<ChunkRoot> // one per loaded chunk
-bitmask_ids      : array<u16>       // shape index per block state (~58 KB, fits in L1)
-shape_table      : array<u32>       // unique bitmask shapes: coarse(2u32) + bitmask(128u32) each (~203 KB, fits in L2)
-color_ids        : array<u16>       // payload index per block state (~58 KB, fits in L1)
-payload_offsets  : array<u32>       // byte offset into payload_data per unique payload (~17 KB)
-payload_data     : array<u32>       // deduplicated palette + indices (~4 MB, cold path)
-```
+The loader uploads everything to VRAM as GPU storage buffers once at session start:
 
-WGSL bindings:
-```wgsl
-@group(0) @binding(0) var<storage, read> svo_nodes:       array<SvoNode>;
-@group(0) @binding(1) var<storage, read> child_ids:       array<u32>;
-@group(0) @binding(2) var<storage, read> leaf_data:       array<u32>;
-@group(0) @binding(3) var<storage, read> chunk_roots:     array<ChunkRoot>;
-@group(0) @binding(4) var<storage, read> bitmask_ids:     array<u32>; // u16 packed
-@group(0) @binding(5) var<storage, read> shape_table:     array<u32>;
-@group(0) @binding(6) var<storage, read> color_ids:       array<u32>; // u16 packed
-@group(0) @binding(7) var<storage, read> payload_offsets: array<u32>;
-@group(0) @binding(8) var<storage, read> payload_data:    array<u32>;
-```
+- Leaf bitmask array
+- Interior node array
+- Chunk index
+- Block state to shape index mapping (~58 KB, fits in L1)
+- Shape table (~203 KB, fits in L2)
+- Block state to payload index mapping (~58 KB, fits in L1)
+- Payload byte offsets (~66 KB)
+- Payload color data (~4 MB, cold path)
 
-### Memory Budget (approximate, 512x384x512 block region)
+### Traversal
 
-| Structure                               | Size estimate  |
-|-----------------------------------------|----------------|
-| SVDAG nodes (post-DAG)                  | 8–60 MB        |
-| child_ids + leaf_data                   | 4–20 MB        |
-| bitmask_ids + shape_table               | ~261 KB        |
-| color_ids + payload_offsets + payloads  | ~4 MB          |
-| **Total**                               | **~16–84 MB**  |
+Each GPU thread handles one pixel. The tracer descends the contree from the chunk root. At each interior node, it computes which child slot the ray enters, checks the child presence mask, reads the child ID from the geometry bit stream, and continues down. At depth-2, it reads a leaf bitmask and checks the final bit.
 
-The range is wide because compression ratio depends heavily on world content. A generated vanilla world compresses much more than a dense player-built structure.
-
----
-
-## Tracer
-
-The Tracer raymarches through the SVDAG on the GPU and handles lighting and shadows. It runs a WGSL compute shader with one thread per pixel.
-
-### Two-Level Traversal
-
-**Level 1: Block-level SVDAG.** Standard stackless SVO traversal. Each step skips entire octree subtrees of empty or homogeneous space in O(log n). The DAG deduplication means repeated regions collapse to shared nodes, so traversal is fast even in huge worlds.
-
-A ray descends until it reaches a leaf node (a single block position), then enters Level 2.
-
-**Level 2: Brick DDA.** The leaf stores a BlockStateId (u16) that indexes into the material lookup. The lookup entry contains the pre-baked 16x16x16 geometry bitmask and material data, already oriented correctly. No runtime rotation needed.
-
-A 3D DDA walks through the 16x16x16 bitmask (512 bytes). Once loaded, all geometry checks are free bitwise operations with no further memory accesses. A hierarchical 4x4x4 coarse bitmask lets the DDA skip empty 4x4x4 regions in a single step.
-
-### Cone Ray LOD
-
-Distant voxels that project to less than one pixel cause shimmer and aliasing. Chisel eliminates this by casting a cone instead of an infinitely thin ray. The cone's half-angle corresponds to exactly one pixel at the current FOV.
-
-At each inner node during SVDAG traversal, the renderer checks whether the node's bounding volume fits entirely within the cone. If it does, the node is sub-pixel and the renderer reads the node's pre-cached face color for the entry face and returns immediately. No brick DDA needed.
-
-Every inner node stores 6 precomputed average colors, one per axis-aligned face (+X, -X, +Y, -Y, +Z, -Z). These are computed offline during SVDAG construction, bottom-up from the leaves.
-
-LOD threshold check:
-```wgsl
-fn node_subtends_less_than_one_pixel(node_half_size: f32, distance: f32, pixel_solid_angle: f32) -> bool {
-  let projected = (2.0 * node_half_size / distance) / pixel_solid_angle;
-  return projected < 1.0;
-}
-```
+When the ray hits an occupied leaf, it looks up the block's 16x16x16 geometry bitmask for fine-grained intersection. A hierarchical coarse bitmask (one bit per 4x4x4 sub-region) lets the traversal skip empty sub-regions in a single step. Once loaded, all geometry checks are bitwise operations with no further memory accesses.
 
 ### Lighting
 
-Primary visibility plus hard shadow rays. Sun directional light with basic Lambertian shading.
+Primary visibility plus hard shadow rays. Sun directional light with Lambertian shading.
+
+---
+
+## Research Findings and Design History
+
+### Entropy of Minecraft Worlds
+
+Measured on Hermitcraft Season 10:
+
+- Global Shannon entropy: 1.63 bits/block (including air). Theoretical minimum for independent-voxel compression.
+- First-order spatial entropy (block given neighbor): 0.23 bits/block. Blocks are highly correlated with neighbors (86% reduction vs global entropy). Large flat terrain layers create extremely long runs of identical blocks.
+- Average run length in X/Z: 22 blocks. 70% of blocks are in runs of 64+. This is why contrees with 4^3 branching work well, since entire 4x4 slabs of terrain collapse to uniform nodes.
+- Unique geometry patterns at 4^3: 4.1M out of a theoretical 2^64 possible. Under 3-axis mirror symmetry these could collapse to about 1/3 to 1/4 as many canonical patterns.
+
+### Compression Bounds
+
+- Global Shannon bound: 2,330 MB (1.63 bits * 14.7B voxels / 8)
+- First-order spatial bound: 322 MB (0.23 bits * 14.7B voxels / 8)
+- v14 culled at 170 MB beats the spatial bound because culling removes 97% of voxels from the dataset entirely
+
+### Comparison with HashDAG (Careil et al. 2020)
+
+The HashDAG paper uses a standard octree with 4^3 fat-leaf nodes (64 voxels per leaf stored as a 64-bit bitmask). Our v14 contree uses the same leaf encoding. Key differences:
+
+| | HashDAG | v14 Contree |
+|-|---------|-------------|
+| Tree structure above leaves | Octree (2^3 branching) | Contree (4^3 branching) |
+| Leaf encoding | 64-bit bitmask | 64-bit bitmask |
+| Fully-occupied sentinel | None (pre-inserted full node) | None |
+| Interior node size | 4 bytes + k*4 bytes | 12 bytes + implicit in bit stream |
+
+HashDAG achieves ~168 bits/node on static architecture scenes. Our contree has more bytes per upper node but far fewer total nodes, leading to better total geometry size on Minecraft terrain data.
+
+### Why the Leaf Mask Was Redundant (v13 to v14)
+
+In v13, every node stored a leaf mask tracking which children were the "fully occupied" sentinel. At depth-1 (the voxel level), the leaf mask was always identical to the child presence mask because voxel children are either empty or fully occupied, never partial. This wasted 8 bytes per depth-1 node and stored useless sentinel pointer entries in the child array.
+
+The fix: store depth-1 nodes as raw 64-bit bitmasks instead. Drop the leaf mask at all depths. Replace the fully-occupied sentinel with natural deduplication. The all-ones bitmask is just one more leaf ID.
+
+Savings on Hermitcraft:
+- 4.1M depth-1 nodes: 20 bytes to 8 bytes = 49.6 MB saved
+- 658K depth-2 nodes: 20 bytes to 12 bytes = 5.3 MB saved
+- 21K depth-3 nodes: 20 bytes to 12 bytes = 0.2 MB saved
+- Extra bit stream (full subtrees now write 25 bits each): +2 MB
+- Net: ~53 MB saved on geometry
+
+### Formats Tested and Rejected
+
+v10/v11/v12: Earlier iterations with different attribute encodings or octree geometry. Superseded by v13/v14.
+
+v8/v9 (Unified): Combined geometry and attributes into a single global tile pool of 4^3 canonical block type patterns. Competitive on compression but more complex to traverse and less cache-friendly.
+
+Super-chunk (128^3) palettes: Tested. 0.81 MB worse. Larger palette increases bits per index more than it saves on palette header count.
+
+Octree vs contree: Both tested at equal culling. Contree wins by ~12 MB on Hermitcraft (170 MB vs 182 MB) due to 37% fewer total nodes.
+
+### Unexplored Techniques
+
+SSVDAGs (Jaspe et al. 2016): Symmetry-aware DAGs that identify nodes related by mirror reflection and store one canonical form plus a 3-bit transform flag. Could reduce the 4.1M unique leaf bitmasks by 2-4x. Each 64-bit leaf bitmask has up to 8 mirror images under 3-axis reflections; the canonical form is the minimum. This is the most promising remaining compression technique.
+
+Entropy coding of the bit stream: The 25-bit child pointers use fixed-width encoding. Lower-depth nodes tend to have smaller IDs (denser). Variable-length coding could save a few MB.
+
+Improved attribute compression: The attribute stream (73.75 MB culled) is now larger than the geometry stream (97 MB culled). The Dolonius et al. block-compression approach for color data might improve attribute compression further.
 
 ---
 
 ## Future Work
 
-**Pre-1.13 world support.** The Reader currently handles 1.13+. Pre-flattening worlds (1.12 and earlier) need a static (block_id, metadata) -> modern block state string lookup table in `legacy.rs`.
+**Pre-1.13 world support.** The reader handles 1.13+. Pre-flattening worlds (1.12 and earlier) need a static lookup table mapping numeric block IDs and metadata values to modern block state strings.
 
-**Transparent block rendering.** Alpha is sampled from textures and averaged per voxel just like RGB (glass, stained glass, ice, and water have real sub-255 alpha values in the baked data). The ray caster currently treats all hits as opaque and needs to be updated to use the alpha channel.
+**Transparent block rendering.** Alpha is sampled from textures and averaged per voxel like RGB. The ray caster currently treats all hits as opaque and needs to be updated to use the alpha channel.
 
-**Biome tinting.** Grass, leaves, and water change color per biome. The Carver currently bakes a single default color.
+**Biome tinting.** Grass, leaves, and water change color per biome. The carver currently bakes a single default color.
 
-**Emissive blocks.** Glowstone, lava, sea lanterns, etc. The node format has a flags byte reserved for this.
+**Chunk streaming.** For worlds larger than VRAM, the top DAG levels stay resident while leaf chunks stream in and out as the camera moves.
 
-**Chunk streaming.** For worlds larger than VRAM, top SVDAG levels stay resident while leaf chunks stream in and out as the camera moves.
-
-**Multithreading in chisel-pack.** The Reader and Packer both process region files independently. Parallelism with rayon on the native build path is planned but not yet implemented. (chisel-bake's Carver already uses rayon with per-thread JAR handles and texture caches.)
+**Multithreading in chisel-pack.** The reader and packer process region files independently. Parallelism is planned but not yet implemented. (chisel-bake already uses per-thread JAR handles and texture caches.)
 
 ---
 
@@ -526,38 +651,38 @@ chisel/
     materials.bin         # generated by chisel-bake, committed to repo
 
   jars/                   # gitignored
-    server.jar            # used by chisel-bake to generate blocks.json
-    client.jar            # used by chisel-bake (Carver reads models + textures)
+    server.jar
+    client.jar
 
   worlds/                 # gitignored
-    *.zip                 # zipped Minecraft world folders
+    *.zip
 
   core/
     Cargo.toml
     src/
       lib.rs
-      config.rs           # octree depth, brick size constants
+      config.rs
 
       reader/
         mod.rs            # open_world entry point, zip traversal
         region.rs         # .mca file parsing
-        chunk.rs          # chunk location table, decompression, chunk NBT decoding (all DataVersion branches)
-        block_states.rs   # BlockStateTable, build_block_key, load from block_states.bin
+        chunk.rs          # chunk location table, decompression, NBT decoding
+        block_states.rs   # block state table, key builder, block_states.bin loader
         legacy.rs         # pre-1.13 numeric ID + metadata mapping (TODO)
 
       carver/
-        mod.rs            # generate_materials entry point; writes geometry.bin + materials.bin
+        mod.rs            # generate_materials entry point
         jar.rs            # ZIP/JAR reader with entry caching
         model.rs          # model JSON parsing, parent chain resolution, quad generation
         texture.rs        # texture loading, per-brick palette, color sampling
-        voxelizer.rs      # quad-major SAT intersection, color accumulation, VoxelGrid output
+        voxelizer.rs      # quad-major SAT intersection, color accumulation
         brick.rs          # serialize color data (palette + indices) for materials.bin
 
       packer/
         mod.rs
-        octree.rs         # bottom-up SVO construction per chunk
+        contree.rs        # bottom-up contree construction per chunk
         interner.rs       # hash-table DAG deduplication
-        face_color.rs     # bottom-up face color computation for LOD
+        attr.rs           # attribute stream encoding
         serialize.rs      # .chisel file I/O
 
       loader/
@@ -568,7 +693,7 @@ chisel/
       tracer/
         mod.rs
         renderer.rs       # render loop, pass orchestration
-        camera.rs         # camera, view/proj matrices, ray gen, pixel solid angle
+        camera.rs         # camera, view/proj matrices, ray gen
         primary.rs        # primary ray compute pass
         shadow.rs         # shadow ray compute pass
         debug.rs          # debug overlay passes
@@ -588,15 +713,14 @@ chisel/
     Cargo.toml
     src/
       main.rs             # chisel-bake entry point (jars -> block_states.bin + geometry.bin + materials.bin)
-                          # also: --export-vox "block_state_key" reads from data/*.bin to test end-to-end
 
   shaders/
     common.wgsl           # shared structs, math utilities
-    traverse.wgsl         # block-level SVO-DAG traversal with cone LOD
+    traverse.wgsl         # contree DAG traversal
     brick_dda.wgsl        # sub-voxel brick DDA with coarse bitmask
     primary.wgsl          # primary ray dispatch + shading
     shadow.wgsl           # hard shadow ray pass
-    debug.wgsl            # debug overlays (normals, DAG depth, LOD level, bitmask)
+    debug.wgsl            # debug overlays
 ```
 
 ---
@@ -606,7 +730,7 @@ chisel/
 ### YouTube Channels
 
 | Channel | Focus |
-|---|---|
+|---------|-------|
 | [Douglas Dwyer](https://www.youtube.com/@DouglasDwyer) | Octo voxel engine in Rust + WebGPU, path-traced GI |
 | [John Lin (Voxely)](https://www.youtube.com/@johnlin) | Path-traced voxel sandbox engine, RTX |
 | [Gabe Rundlett](https://www.youtube.com/@GabeRundlett) | Open-source C++ voxel engine with Daxa/Vulkan |
@@ -617,7 +741,7 @@ chisel/
 ### Projects and Repos
 
 | Project | Description |
-|---|---|
+|---------|-------------|
 | [VoxelRT](https://github.com/dubiousconst282/VoxelRT) | Voxel rendering experiments: brickmap, Tree64, XBrickMap, MultiDDA benchmarks |
 | [HashDAG](https://github.com/Phyronnaz/HashDAG) | Official open-source implementation of the HashDAG paper (Careil et al. 2020) |
 | [Voxelis](https://github.com/WildPixelGames/voxelis) | Pure Rust SVO-DAG crate with batching, reference counting, Bevy/Godot bindings |
@@ -627,17 +751,17 @@ chisel/
 | [gvox](https://github.com/GabeRundlett/gvox) | General voxel format translation library |
 | [VoxelHex](https://github.com/Ministry-of-Voxel-Affairs/VoxelHex) | Sparse VoxelBrick Tree with ray tracing support |
 | [tree64](https://github.com/expenses/tree64) | Rust sparse 64-tree with hashing, based on dubiousconst282's guide |
-| [binary-greedy-meshing](https://github.com/cgerikj/binary-greedy-meshing) | Fast bitwise voxel meshing, contributed to by Ethan Gore |
+| [binary-greedy-meshing](https://github.com/cgerikj/binary-greedy-meshing) | Fast bitwise voxel meshing |
 
 ### Blog Posts
 
 | Resource | Description |
-|---|---|
+|----------|-------------|
 | [A guide to fast voxel ray tracing using sparse 64-trees](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/) | Comprehensive guide: 64-tree traversal, brickmap comparison, benchmarks |
 | [A Rundown on Brickmaps](https://uygarb.dev/posts/0003_brickmap_rundown/) | Clear explanation of the van Wingerden brickmap/brickgrid structure |
 | [The Perfect Voxel Engine](https://voxely.net/blog/the-perfect-voxel-engine/) | John Lin's vision post on voxel engine architecture |
 | [A Voxel Renderer for Learning C/C++](https://jacco.ompf2.com/2021/02/01/a-voxel-renderer-for-learning-c-c/) | Two-level grid renderer, solid color bricks, OpenCL, 1B rays/sec |
-| [Voxel raytracing](https://tenebryo.github.io/posts/2021-01-13-voxel-raymarching.html) | SVDAG path tracer writeup inspired by John Lin |
+| [Voxel raytracing](https://tenebryo.github.io/posts/2021-01-13-voxel-raymarching.html) | SVDAG path tracer writeup |
 | [Voxelisation Algorithms review](https://pmc.ncbi.nlm.nih.gov/articles/PMC8707769/) | Comprehensive survey of voxel data structures |
 | [Voxel.Wiki: Raytracing](https://voxel.wiki/wiki/raytracing/) | Community wiki curating voxel raycasting resources and papers |
 | [Amanatides & Woo DDA explainer](https://m4xc.dev/articles/amanatides-and-woo/) | Deep dive into the DDA algorithm with visuals |
@@ -645,7 +769,7 @@ chisel/
 ### ShaderToy
 
 | Shader | Description |
-|---|---|
+|--------|-------------|
 | [Radiance Cascades 3D (surface-based)](https://www.shadertoy.com/view/X3XfRM) | Surface-based 3D RC, 5 cascades, cubemap storage |
 | [Radiance Cascades (volumetric voxel)](https://www.shadertoy.com/view/M3ycWt) | True volumetric 3D RC with voxel raycaster |
 | [Amanatides & Woo DDA (branchless)](https://www.shadertoy.com/view/XdtcRM) | Clean branchless 3D DDA implementation |
@@ -653,16 +777,18 @@ chisel/
 ### Papers
 
 #### Foundational Ray Traversal
+
 | Paper | Link |
-|---|---|
+|-------|------|
 | A Fast Voxel Traversal Algorithm for Ray Tracing, Amanatides & Woo 1987 | [PDF](http://www.cse.yorku.ca/~amana/research/grid.pdf) |
 | Efficient Sparse Voxel Octrees, Laine & Karras 2010 | [ResearchGate](https://www.researchgate.net/publication/47645140_Efficient_Sparse_Voxel_Octrees) |
 | GigaVoxels: Ray-Guided Streaming for Efficient and Detailed Voxel Rendering, Crassin et al. 2009 | [INRIA](http://maverick.inria.fr/Publications/2009/CNLE09/) |
 | Real-time Ray Tracing and Editing of Large Voxel Scenes (Brickmap), van Wingerden 2015 | [Utrecht](https://studenttheses.uu.nl/handle/20.500.12932/20460) |
 
 #### SVDAG Family
+
 | Paper | Link |
-|---|---|
+|-------|------|
 | High Resolution Sparse Voxel DAGs, Kampe, Sintorn, Assarsson 2013 | [PDF](https://icg.gwu.edu/sites/g/files/zaxdzs6126/files/downloads/highResolutionSparseVoxelDAGs.pdf) |
 | SSVDAGs: Symmetry-aware Sparse Voxel DAGs, Villanueva, Marton, Gobbetti 2016 | [ACM](https://dl.acm.org/doi/10.1145/2856400.2856406) |
 | Interactively Modifying Compressed Sparse Voxel Representations (HashDAG), Careil, Billeter, Eisemann 2020 | [Wiley](https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.13916) |
@@ -672,14 +798,16 @@ chisel/
 | Editing Compressed High-Resolution Voxel Scenes with Attributes, Molenaar & Eisemann 2023 | [Wiley](https://onlinelibrary.wiley.com/doi/full/10.1111/cgf.14757) |
 
 #### Color and Attribute Compression
+
 | Paper | Link |
-|---|---|
+|-------|------|
 | Geometry and Attribute Compression for Voxel Scenes (Dado), Dado et al. 2016 | [CGF](https://diglib.eg.org/handle/10.1111/cgf.12841) |
 | Compressing Color Data for Voxelized Surface Geometry (Dolonius), Dolonius et al. 2017 | [ACM I3D](https://dl.acm.org/doi/10.1145/3023368.3023381) |
 
 #### Surveys
+
 | Paper | Link |
-|---|---|
+|-------|------|
 | Hybrid Voxel Formats for Efficient Ray Tracing, 2024 | [arxiv](https://arxiv.org/abs/2410.14128) |
 | Aokana: A GPU-Driven Voxel Rendering Framework for Open World Games, 2025 | [arxiv](https://arxiv.org/abs/2505.02017) |
 | Voxelisation Algorithms and Data Structures: A Review, PMC 2021 | [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC8707769/) |
@@ -687,7 +815,7 @@ chisel/
 ### Misc
 
 | Resource | Description |
-|---|---|
+|----------|-------------|
 | [Voxel.Wiki](https://voxel.wiki) | Community wiki, good starting hub for voxel rendering resources |
 | [Voxely.net blog](https://voxely.net/blog/) | John Lin's blog on voxel engine design |
 | [Jacco's voxel blog series](https://jacco.ompf2.com) | Practical renderer tutorials with OpenCL |
